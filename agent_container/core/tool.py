@@ -31,6 +31,7 @@ class ErrorCategory(StrEnum):
     VALIDATION = "validation"  # the input was wrong; fix it
     PERMISSION = "permission"  # not allowed, now or ever for this caller
     BUSINESS = "business"  # a rule said no; explain it, do not retry
+    INTERNAL = "internal"  # the tool broke; nothing the caller did, and no rule to explain
 
 
 class StagedChange(ABC):

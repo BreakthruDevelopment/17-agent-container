@@ -347,7 +347,7 @@ class AgentLoop:
                     # Log the type and the tool, not the message: it may carry user data.
                     _log.error("tool %s raised %s", call.name, type(exc).__name__)
                     result = ToolResult.error(
-                        ErrorCategory.BUSINESS,
+                        ErrorCategory.INTERNAL,
                         "the tool failed with an internal error and cannot be retried",
                     )
         result = await self.after_tool(run.state(), call, result)

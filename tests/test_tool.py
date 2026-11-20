@@ -114,8 +114,20 @@ def test_retryability_can_be_overridden() -> None:
     assert not ToolResult.error(ErrorCategory.TRANSIENT, "x", retryable=False).is_retryable
 
 
-def test_the_four_categories_are_exactly_the_specs() -> None:
-    assert {c.value for c in ErrorCategory} == {"transient", "validation", "permission", "business"}
+def test_the_categories_are_exactly_the_specs() -> None:
+    """The spec named four; `internal` was added on 2026-11-20 (review of PR #9).
+
+    An unhandled exception in a tool is not `business` ("a rule said no") -- app 18 would explain a
+    policy that does not exist. Adding the member now is free; adding it after 17.3 and 17.4 ship
+    `match` statements over this enum is a break across four repos.
+    """
+    assert {c.value for c in ErrorCategory} == {
+        "transient",
+        "validation",
+        "permission",
+        "business",
+        "internal",
+    }
 
 
 def test_inconsistent_results_are_rejected() -> None:
