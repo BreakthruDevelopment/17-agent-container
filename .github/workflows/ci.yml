@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# GitHub's default run shell is `bash -e {0}`, which takes a pipeline's status from its LAST command. Without
+# pipefail, `agent-container demo | tee smoke.out` reports tee's status and a CLI that prints the expected lines
+# and then exits non-zero goes green. This check is what every merge in the track keys off, and slice 17.6
+# replaces the stub with a loop that can fail after emitting output, so the pipeline status has to be the real one.
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    # The name is load-bearing: the merge rules and the review gate key off it.
+    name: Lint, test, build, smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # No AWS access: this repo's CI runs on recorded replies and never reads the Bedrock secrets.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy --strict
+      - run: uv run pytest
+      - name: Build the package
+        run: |
+          uv build
+          uv venv --python 3.12 /tmp/wheel-check
+          uv pip install --python /tmp/wheel-check/bin/python dist/*.whl
+          /tmp/wheel-check/bin/python -c "import agent_container, agent_container.core"
+      - name: Smoke test (CLI on recorded replies)
+        run: |
+          /tmp/wheel-check/bin/agent-container demo | tee smoke.out
+          grep -q "stop_reason=end_turn" smoke.out
+          grep -q "demo ok" smoke.out
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner
+          push: false
+          load: true
+          tags: agent-container:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run the demo in the image
+        run: docker run --rm agent-container:ci demo | grep -q "demo ok"

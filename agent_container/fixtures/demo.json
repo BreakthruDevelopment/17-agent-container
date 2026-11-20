@@ -1,0 +1,7 @@
+{
+  "description": "Recorded replies for the demo. Hand-written stub until the recorder (slice 17.3) exists.",
+  "replies": [
+    {"stop_reason": "tool_use", "text": "Looking that up."},
+    {"stop_reason": "end_turn", "text": "Done."}
+  ]
+}
