@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "A reusable agent core: loop, model providers, tool contracts, permission gate, budget."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "pydantic>=2.9,<3",
+]
 
 [project.scripts]
 agent-container = "agent_container.cli:main"
@@ -13,6 +15,7 @@ agent-container = "agent_container.cli:main"
 dev = [
     "mypy>=1.13",
     "pytest>=8.3",
+    "pytest-asyncio>=1.0",
     "ruff>=0.8",
 ]
 
@@ -43,3 +46,5 @@ warn_unreachable = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

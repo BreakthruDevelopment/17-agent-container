@@ -2,3 +2,103 @@
 
 Wave 1 of the spec owns this directory. Later slices extend it by adding files.
 """
+
+from agent_container.core.budget import Budget, BudgetExceeded
+from agent_container.core.errors import (
+    AgentContainerError,
+    BudgetAlreadyStarted,
+    InputTooLarge,
+    MalformedModelResponse,
+    ReplayExhausted,
+    ReplayFormatError,
+    UnrecognizedStopReason,
+)
+from agent_container.core.fence import fence_tool_output, system_notice
+from agent_container.core.loop import (
+    MAX_USER_MESSAGE_CHARS,
+    AgentLoop,
+    EndReason,
+    LoopEvent,
+    LoopEventKind,
+    LoopObserver,
+    RunResult,
+    RunState,
+    ToolCallRecord,
+)
+from agent_container.core.messages import (
+    ContentBlock,
+    JsonObject,
+    Message,
+    ModelRequest,
+    ModelResponse,
+    StopReason,
+    TextBlock,
+    ToolChoice,
+    ToolResultBlock,
+    ToolSpec,
+    ToolUseBlock,
+    Usage,
+)
+from agent_container.core.provider import ModelProvider
+from agent_container.core.replay import ReplayProvider, dump_replies, parse_replies
+from agent_container.core.tool import (
+    AnyTool,
+    Effect,
+    ErrorCategory,
+    Identity,
+    StagedChange,
+    Tool,
+    ToolContext,
+    ToolResult,
+    innermost,
+    walk_stack,
+)
+
+__all__ = [
+    "MAX_USER_MESSAGE_CHARS",
+    "AgentContainerError",
+    "AgentLoop",
+    "AnyTool",
+    "Budget",
+    "BudgetAlreadyStarted",
+    "BudgetExceeded",
+    "ContentBlock",
+    "Effect",
+    "EndReason",
+    "ErrorCategory",
+    "Identity",
+    "InputTooLarge",
+    "JsonObject",
+    "LoopEvent",
+    "LoopEventKind",
+    "LoopObserver",
+    "MalformedModelResponse",
+    "Message",
+    "ModelProvider",
+    "ModelRequest",
+    "ModelResponse",
+    "ReplayExhausted",
+    "ReplayFormatError",
+    "ReplayProvider",
+    "RunResult",
+    "RunState",
+    "StagedChange",
+    "StopReason",
+    "TextBlock",
+    "Tool",
+    "ToolCallRecord",
+    "ToolChoice",
+    "ToolContext",
+    "ToolResult",
+    "ToolResultBlock",
+    "ToolSpec",
+    "ToolUseBlock",
+    "UnrecognizedStopReason",
+    "Usage",
+    "dump_replies",
+    "fence_tool_output",
+    "innermost",
+    "parse_replies",
+    "system_notice",
+    "walk_stack",
+]

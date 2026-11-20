@@ -1,0 +1,96 @@
+"""Test doubles shared across the suite."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from pydantic import BaseModel
+
+from agent_container.core import (
+    AnyTool,
+    Effect,
+    ModelResponse,
+    ReplayProvider,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolUseBlock,
+    Usage,
+)
+
+
+class EchoArgs(BaseModel):
+    text: str
+
+
+class EchoTool(Tool[EchoArgs]):
+    """A read tool that returns what it is given, or whatever `reply` says."""
+
+    name = "echo"
+    description = "Echo the text back."
+    effect = Effect.READ
+    input_model = EchoArgs
+
+    def __init__(self, reply: Callable[[EchoArgs], ToolResult] | None = None) -> None:
+        self.reply = reply
+        self.calls: list[EchoArgs] = []
+        self.contexts: list[ToolContext] = []
+
+    async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+        self.calls.append(args)
+        self.contexts.append(ctx)
+        return self.reply(args) if self.reply else ToolResult.ok(f"echo: {args.text}")
+
+
+class DeleteTool(Tool[EchoArgs]):
+    """A write tool, for the effect tests."""
+
+    name = "delete"
+    description = "Delete something."
+    effect = Effect.WRITE
+    input_model = EchoArgs
+
+    async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+        return ToolResult.ok("deleted")
+
+
+class PassThrough[A: BaseModel](Tool[A]):
+    """The smallest decorator: wraps a tool and forwards everything (17.4's have this shape)."""
+
+    def __init__(self, inner: Tool[A]) -> None:
+        self._inner = inner
+
+    @property
+    def name(self) -> str:
+        return self._inner.name
+
+    @property
+    def description(self) -> str:
+        return self._inner.description
+
+    @property
+    def effect(self) -> Effect:
+        return self._inner.effect
+
+    @property
+    def input_model(self) -> type[A]:
+        return self._inner.input_model
+
+    @property
+    def wrapped(self) -> AnyTool | None:
+        return self._inner
+
+    async def run(self, args: A, ctx: ToolContext) -> ToolResult:
+        return await self._inner.run(args, ctx)
+
+
+def tool_call(text: str = "hi", *, id: str = "call-1", name: str = "echo") -> ToolUseBlock:
+    return ToolUseBlock(id, name, {"text": text})
+
+
+def use_tool(*calls: ToolUseBlock, text: str = "", usage: Usage | None = None) -> ModelResponse:
+    return ModelResponse.of(text, stop_reason="tool_use", tool_uses=calls, usage=usage)
+
+
+def scripted(*replies: ModelResponse) -> ReplayProvider:
+    return ReplayProvider(list(replies))
