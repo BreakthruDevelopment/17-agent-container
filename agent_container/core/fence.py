@@ -35,9 +35,17 @@ def fence_tool_output(
     `MAX_TOOL_OUTPUT_CHARS` is cut and says so. The header attributes are written by the library,
     not the tool.
     """
-    body = _strip_nonce(content, nonce)
-    if len(body) > MAX_TOOL_OUTPUT_CHARS:
-        body = body[:MAX_TOOL_OUTPUT_CHARS] + "\n[output truncated by the library]"
+    # Cap BEFORE stripping, not after. Stripping to a fixed point is O(passes x length) and the
+    # caller chooses the pass count -- nesting N[0] + S + N[1:] needs one pass per layer -- so
+    # stripping first lets a large input burn seconds of CPU to produce a short body. This is
+    # synchronous and sits outside the loop's `asyncio.timeout`, so it would block the event loop
+    # and defeat the wall-clock budget. The slack of len(nonce) keeps a marker from surviving by
+    # straddling the cut; the final cap below trims what stripping leaves.
+    over = len(content) > MAX_TOOL_OUTPUT_CHARS
+    body = _strip_nonce(content[: MAX_TOOL_OUTPUT_CHARS + len(nonce)], nonce)
+    body = body[:MAX_TOOL_OUTPUT_CHARS]
+    if over:
+        body += "\n[output truncated by the library]"
     status = f"error:{category.value}" if category is not None else "ok"
     retry = f' retryable="{str(retryable).lower()}"' if category is not None else ""
     attrs = (
@@ -59,6 +67,8 @@ def _strip_nonce(value: str, nonce: str) -> str:
     prompt -- so a tool it names can carry that payload into a result and re-form a genuine closing
     marker. Looping to a fixed point terminates, because each pass strictly shortens the string.
     """
+    if not nonce:  # `"" in value` is always true: the loop below would never end.
+        return value
     while nonce in value:
         value = value.replace(nonce, "")
     return value

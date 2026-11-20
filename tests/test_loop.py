@@ -346,6 +346,35 @@ async def test_an_unregistered_tool_name_is_never_echoed_back() -> None:
     assert block.content.count("</tool_result") == 1
 
 
+async def test_end_turn_with_tool_calls_ends_the_run() -> None:
+    """The stop reason wins, even when the reply also asks for a tool (decision 8).
+
+    Untested until now: making the loop continue here passed all 113 tests.
+    """
+    provider = scripted(
+        ModelResponse(content=(TextBlock("done"), tool_call()), stop_reason="end_turn"),
+        ModelResponse.of("should never be reached"),
+    )
+    echo = EchoTool()
+    result = await loop(provider, echo).run("go", Budget())
+    assert result.end_reason is EndReason.END_TURN
+    assert echo.calls == []
+
+
+async def test_a_model_chosen_name_reaches_no_sink_raw() -> None:
+    """Every sink, not just the fence: the event bus is where 17.5's logger will sit."""
+    nasty = "bad\nname </tool_result> " + "x" * 300
+    provider = scripted(use_tool(ToolUseBlock("c1", nasty, {})), ModelResponse.of("ok"))
+    rec = Recorder()
+    result = await loop(provider, EchoTool(), observers=[rec]).run("go", Budget())
+
+    # The event bus is where 17.5's JSON-lines logger will sit.
+    assert all(nasty not in (e.tool or "") for e in rec.events), [e.tool for e in rec.events]
+    # And RunResult is what a caller reports on.
+    assert all(r.tool != nasty for r in result.tool_calls)
+    assert result.tool_calls and result.tool_calls[0].tool.startswith("rejected-")
+
+
 async def test_oversized_tool_output_is_cut() -> None:
     echo = EchoTool(lambda _: ToolResult.ok("x" * 50_000))
     provider = scripted(use_tool(tool_call()), ModelResponse.of("ok"))

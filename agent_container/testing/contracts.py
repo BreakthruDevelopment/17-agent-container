@@ -41,7 +41,7 @@ from agent_container.core.tool import (
     walk_stack,
 )
 
-_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_TOOL_NAME = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")  # \Z, not $: `$` allows a trailing newline
 
 
 def _require(condition: bool, message: str) -> None:

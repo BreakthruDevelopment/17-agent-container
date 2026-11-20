@@ -48,7 +48,7 @@ MAX_USER_MESSAGE_CHARS = 8_000
 
 # A tool name is an identifier. The same shape the provider contract enforces, applied at the
 # boundary so a model-chosen name never reaches a fenced result, a header or a log line.
-_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_TOOL_NAME = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")  # \Z, not $: `$` allows a trailing newline
 
 
 def _safe_name(name: str) -> str:
@@ -366,21 +366,25 @@ class AgentLoop:
                     )
         result = await self.after_tool(run.state(), call, result)
 
+        # Every sink takes the sanitised name, not just the fence and the log line. The event bus
+        # is where 17.5's JSON-lines logger sits, and RunResult is what a caller reports on, so a
+        # model-chosen name must not arrive raw at either.
+        safe = _safe_name(call.name)
         run.tool_calls.append(
-            ToolCallRecord(run.turn, call.name, call.id, result.is_error, result.error_category)
+            ToolCallRecord(run.turn, safe, call.id, result.is_error, result.error_category)
         )
         if result.staged is not None:
             run.staged.append(result.staged)
-        await self._publish(run, LoopEventKind.TOOL_CALLED, tool=call.name)
+        await self._publish(run, LoopEventKind.TOOL_CALLED, tool=safe)
         if result.is_error:
             category = result.error_category.value if result.error_category else ""
-            await self._publish(run, LoopEventKind.TOOL_FAILED, tool=call.name, detail=category)
+            await self._publish(run, LoopEventKind.TOOL_FAILED, tool=safe, detail=category)
         return ToolResultBlock(
             tool_use_id=call.id,
             content=fence_tool_output(
                 # Sanitised, not raw: the header reads as library-written, so a model-chosen name
                 # carrying instructions is worse there than in the body.
-                tool=_safe_name(call.name),
+                tool=safe,
                 tool_use_id=call.id,
                 content=result.content,
                 nonce=run.nonce,

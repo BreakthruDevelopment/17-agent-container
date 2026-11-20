@@ -124,7 +124,46 @@ def test_a_nonce_that_reforms_after_one_pass_is_still_removed() -> None:
 
 
 def test_a_reforming_nonce_in_an_attribute_is_also_removed() -> None:
+    """Nested deeply enough that a single-pass strip leaves the nonce behind.
+
+    One layer is not enough to prove the fixed point: `_attr` also removes angle brackets, so a
+    one-layer payload is caught either way. Three layers need three passes.
+    """
     nonce = "deadbeefcafe0123"
-    reforming = nonce[0] + nonce + nonce[1:]
-    out = fence_tool_output(tool=f"x fence={reforming}", tool_use_id="t1", content="b", nonce=nonce)
-    assert out.count(f"fence={nonce}>") == 2
+    payload = nonce
+    for _ in range(3):
+        payload = nonce[0] + payload + nonce[1:]
+    out = fence_tool_output(tool=f"x {payload}", tool_use_id="t1", content="b", nonce=nonce)
+    header = out.split("\n")[0]
+    assert nonce not in header.replace(f" fence={nonce}>", "")
+
+
+def test_stripping_is_bounded_by_the_cap_not_by_the_input() -> None:
+    """Strip after capping, not before.
+
+    Stripping to a fixed point costs one pass per nested layer, and the caller chooses the layers.
+    Done before the cap, a large input burns CPU to produce a short body -- synchronously, outside
+    the loop's `asyncio.timeout`, so it would block the event loop and defeat the wall-clock
+    budget that `Budget` exists to enforce.
+    """
+    import time
+
+    nonce = "deadbeefcafe0123"
+    payload = nonce
+    for _ in range(20_000):
+        payload = nonce[0] + payload + nonce[1:]
+    assert len(payload) > 300_000
+
+    started = time.perf_counter()
+    out = fence_tool_output(tool="ok", tool_use_id="t1", content=payload, nonce=nonce)
+    assert time.perf_counter() - started < 1.0
+    assert out.count(f"</tool_result fence={nonce}>") == 1
+
+
+def test_an_empty_nonce_does_not_hang() -> None:
+    """`"" in value` is always true, so a naive fixed point never ends.
+
+    `fence_tool_output` is exported, so 17.3 and 17.4 can call it directly; the loop only avoids
+    this by the accident of a falsy nonce never being generated.
+    """
+    assert fence_tool_output(tool="ok", tool_use_id="t1", content="body", nonce="")
