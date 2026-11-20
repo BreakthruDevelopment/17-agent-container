@@ -35,7 +35,7 @@ def fence_tool_output(
     `MAX_TOOL_OUTPUT_CHARS` is cut and says so. The header attributes are written by the library,
     not the tool.
     """
-    body = content.replace(nonce, "")
+    body = _strip_nonce(content, nonce)
     if len(body) > MAX_TOOL_OUTPUT_CHARS:
         body = body[:MAX_TOOL_OUTPUT_CHARS] + "\n[output truncated by the library]"
     status = f"error:{category.value}" if category is not None else "ok"
@@ -51,6 +51,19 @@ def fence_tool_output(
 MAX_ATTR_CHARS = 200
 
 
+def _strip_nonce(value: str, nonce: str) -> str:
+    """Remove the nonce until it stops appearing.
+
+    `str.replace` does not rescan its own output, so one pass is not enough: `N[0] + N + N[1:]`
+    becomes exactly `N` after a single replace. The model knows the nonce -- it is in the system
+    prompt -- so a tool it names can carry that payload into a result and re-form a genuine closing
+    marker. Looping to a fixed point terminates, because each pass strictly shortens the string.
+    """
+    while nonce in value:
+        value = value.replace(nonce, "")
+    return value
+
+
 def _attr(value: str, nonce: str) -> str:
     """Neutralise an attribute value the model may control.
 
@@ -62,7 +75,7 @@ def _attr(value: str, nonce: str) -> str:
     fenced data.
     """
     cleaned = (
-        value.replace(nonce, "")
+        _strip_nonce(value, nonce)
         .replace("<", "")
         .replace(">", "")
         .replace('"', "'")

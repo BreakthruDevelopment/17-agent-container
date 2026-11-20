@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import uuid
 from collections.abc import Sequence
@@ -44,6 +45,16 @@ from agent_container.core.tool import (
 )
 
 MAX_USER_MESSAGE_CHARS = 8_000
+
+# A tool name is an identifier. The same shape the provider contract enforces, applied at the
+# boundary so a model-chosen name never reaches a fenced result, a header or a log line.
+_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _safe_name(name: str) -> str:
+    """A model-controlled name, made safe to display."""
+    return name if _TOOL_NAME.match(name) else f"rejected-{len(name)}-chars"
+
 
 _log = logging.getLogger("agent_container.loop")
 
@@ -326,10 +337,13 @@ class AgentLoop:
 
     async def _run_tool(self, run: _Run, call: ToolUseBlock) -> ToolResultBlock:
         """Run one requested tool and return its fenced result. Unregistered tools never run."""
-        tool = self._tools.get(call.name)
+        tool = self._tools.get(call.name) if _TOOL_NAME.match(call.name) else None
         if tool is None:
+            # Never echo the model's own string back: `call.name` reaches the fenced body, and a
+            # name carrying a re-forming nonce could close the fence early. A tool name is an
+            # identifier, so anything outside the allowlist is simply unavailable.
             result = ToolResult.error(
-                ErrorCategory.PERMISSION, f"tool {call.name!r} is not available to this agent"
+                ErrorCategory.PERMISSION, "that tool is not available to this agent"
             )
         else:
             ctx = ToolContext(run.run_id, run.turn, call.id, self._identity)
@@ -345,7 +359,7 @@ class AgentLoop:
                     )
                 else:
                     # Log the type and the tool, not the message: it may carry user data.
-                    _log.error("tool %s raised %s", call.name, type(exc).__name__)
+                    _log.error("tool %s raised %s", _safe_name(call.name), type(exc).__name__)
                     result = ToolResult.error(
                         ErrorCategory.INTERNAL,
                         "the tool failed with an internal error and cannot be retried",
@@ -364,7 +378,9 @@ class AgentLoop:
         return ToolResultBlock(
             tool_use_id=call.id,
             content=fence_tool_output(
-                tool=call.name,
+                # Sanitised, not raw: the header reads as library-written, so a model-chosen name
+                # carrying instructions is worse there than in the body.
+                tool=_safe_name(call.name),
                 tool_use_id=call.id,
                 content=result.content,
                 nonce=run.nonce,
