@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+# GitHub's default run shell is `bash -e {0}`, which takes a pipeline's status from its LAST command. Without
+# pipefail, `agent-container demo | tee smoke.out` reports tee's status and a CLI that prints the expected lines
+# and then exits non-zero goes green. This check is what every merge in the track keys off, and slice 17.6
+# replaces the stub with a loop that can fail after emitting output, so the pipeline status has to be the real one.
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

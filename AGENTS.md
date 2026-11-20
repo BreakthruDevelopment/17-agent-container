@@ -21,10 +21,15 @@ The BreakthruDevelopment org holds other, unrelated applications.
 - `ruff check` and `ruff format --check`, `mypy --strict`, `pytest`. Strict means strict: no blanket
   `# type: ignore` or `# noqa`. A missing third-party stub gets a narrowly scoped `[[tool.mypy.overrides]]` entry with a
   comment saying why.
-- The package is `agent_container`. **Foundation paths: `agent_container/core/`** (the loop, the provider and tool
-  contracts, the permission gate), plus `pyproject.toml`, `uv.lock`, `Dockerfile` and `.github/`. Wave 1 owns them;
-  later slices extend `core/` by adding files and never edit the foundation unless a security-sensitive `claude` slice
-  names them.
+- The package is `agent_container`. **The foundation path is `agent_container/core/`** — the loop, the provider
+  and tool contracts, the permission gate. Wave 1 owns it. A later slice extends `core/` by adding files and does
+  not edit what is already there unless a security-sensitive `claude` slice names it; if your slice needs a change
+  inside `core/`, stop and comment on the issue.
+- `pyproject.toml`, `uv.lock`, `Dockerfile` and `.github/` are **shared, not foundation.** Any slice may change
+  them for work it owns, and says so on its PR: a slice that adds a dependency edits `pyproject.toml` and relocks
+  (`uv lock`, since CI runs `uv sync --frozen`), and the slice that owns the smoke test edits
+  `.github/workflows/ci.yml`. Two things in there are load-bearing for the whole track and change only on a
+  `claude` slice: the job name `Lint, test, build, smoke` and the `review-gate.yml` caller.
 - Async throughout: `converse`, `Tool.run` and the loop are `async`.
 
 ## The track's rules
