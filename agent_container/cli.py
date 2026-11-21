@@ -6,16 +6,11 @@ import sys
 from importlib import resources
 from typing import Any
 
-_KNOWN_STOP_REASONS = frozenset(
-    {
-        "end_turn",
-        "tool_use",
-        "max_tokens",
-        "stop_sequence",
-        "guardrail_intervened",
-        "content_filtered",
-    }
-)
+from agent_container.core.messages import StopReason
+
+# One source of truth: 17.3 adds stop reasons to StopReason, and a second copy here would drift
+# between then and 17.6 replacing this file.
+_KNOWN_STOP_REASONS = frozenset(r.value for r in StopReason)
 
 
 def load_replies() -> list[dict[str, str]]:
