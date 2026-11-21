@@ -42,6 +42,7 @@ from agent_container.core.messages import (
 from agent_container.core.provider import ModelProvider
 from agent_container.core.replay import ReplayProvider, dump_replies, parse_replies
 from agent_container.core.tool import (
+    GATE_MARKER,
     AnyTool,
     Effect,
     ErrorCategory,
@@ -50,6 +51,7 @@ from agent_container.core.tool import (
     Tool,
     ToolContext,
     ToolResult,
+    WriteGate,
     has_write_gate,
     innermost,
     walk_stack,
@@ -57,6 +59,7 @@ from agent_container.core.tool import (
 )
 
 __all__ = [
+    "GATE_MARKER",
     "MAX_USER_MESSAGE_CHARS",
     "AgentContainerError",
     "AgentLoop",
@@ -97,6 +100,7 @@ __all__ = [
     "ToolUseBlock",
     "UnrecognizedStopReason",
     "Usage",
+    "WriteGate",
     "dump_replies",
     "fence_tool_output",
     "has_write_gate",

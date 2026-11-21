@@ -17,7 +17,7 @@ import logging
 import secrets
 import uuid
 from abc import ABCMeta
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -60,6 +60,11 @@ MAX_USER_MESSAGE_CHARS = 8_000
 # worse than being slow. Revisit if anything ever registers observers in bulk.
 OBSERVER_TIMEOUT_SECONDS = 5.0
 
+# A hook's allowance once the wall clock is already out. Hooks get the remaining clock while there
+# is any; this covers the shutdown path, which still has to answer every outstanding tool call to
+# keep the transcript sendable, and `asyncio.timeout(0)` would fire at its first await.
+HOOK_GRACE_SECONDS = 5.0
+
 # A tool name is an identifier. The same shape the provider contract enforces, applied at the
 # boundary so a model-chosen name never reaches a fenced result, a header or a log line.
 _TOOL_NAME = TOOL_NAME_PATTERN  # one definition, in core.tool
@@ -78,7 +83,7 @@ _log = logging.getLogger("agent_container.loop")
 # `_record` was added on 2026-11-20 when block-building moved out of `_run_tool` into it -- the
 # extraction silently took guarded behaviour out of the guard, which is the hazard to watch for
 # whenever this loop is refactored.
-_SKELETON = ("run", "_call_model", "_run_tool", "_record", "_finish", "_publish")
+_SKELETON = ("run", "_call_model", "_run_tool", "_record", "_finish", "_publish", "_hook")
 
 
 class EndReason(StrEnum):
@@ -206,6 +211,14 @@ class _Run:
 
 # The answer to a tool call the run had no time for, whether it was cut off mid-flight or never
 # dispatched. One definition so both paths report the same thing to the model.
+class _TimedOut:
+    """Sentinel: the wall clock ran out inside an extension hook. Not an error the model sees."""
+
+    __slots__ = ()
+
+
+_HOOK_TIMED_OUT = _TimedOut()
+
 _CUT_OFF = ToolResult.error(
     ErrorCategory.TRANSIENT,
     "the tool was cut off: the run's time budget ran out",
@@ -321,7 +334,11 @@ class AgentLoop(metaclass=_LoopMeta):
         # `_SKELETON`: the metaclass guard must still allow the subclasses this slice makes room
         # for.)
         self._tools: Mapping[str, AnyTool] = MappingProxyType(by_name)
-        self._specs = tuple(ToolSpec(t.name, t.description, t.input_schema()) for t in tools)
+        # From `by_name`, not `tools`: an untyped caller passing a generator would otherwise
+        # get an empty spec list here, having already filled `by_name` on the first pass.
+        self._specs = tuple(
+            ToolSpec(t.name, t.description, t.input_schema()) for t in by_name.values()
+        )
         self._system_prompt = system_prompt
         self._identity = identity or Identity.anonymous()
         self._observers = tuple(observers)
@@ -383,7 +400,13 @@ class AgentLoop(metaclass=_LoopMeta):
                 tools=self._specs,
                 max_tokens=self._max_reply_tokens,
             )
-            request = await self.before_model(run.state(), request)
+            hooked = await self._hook(run, self.before_model(run.state(), request))
+            if isinstance(hooked, _TimedOut):
+                exceeded = BudgetExceeded("wall_clock", budget.elapsed, budget.max_seconds)
+                return await self._finish(
+                    run, EndReason.BUDGET_EXCEEDED, exceeded.message, exceeded
+                )
+            request = hooked
 
             response = await self._call_model(run, request)
             if response is None:
@@ -420,7 +443,11 @@ class AgentLoop(metaclass=_LoopMeta):
                                 # "adjust a tool's result before it is fenced and returned to the
                                 # model", and a cut-off result is fenced and returned. A subclass
                                 # redacting or annotating results must not have this one escape.
-                                cut = await self.after_tool(run.state(), skipped, _CUT_OFF)
+                                cut = await self._hook(
+                                    run, self.after_tool(run.state(), skipped, _CUT_OFF)
+                                )
+                                if isinstance(cut, _TimedOut):
+                                    cut = _CUT_OFF
                                 blocks.append(await self._record(run, skipped, cut))
                             exceeded = BudgetExceeded(
                                 "wall_clock", run.budget.elapsed, run.budget.max_seconds
@@ -431,7 +458,14 @@ class AgentLoop(metaclass=_LoopMeta):
                             )
                         blocks.append(await self._run_tool(run, call))
                     run.messages.append(Message("user", tuple(blocks)))
-                    stop = await self.should_stop(run.state())
+                    stop = await self._hook(run, self.should_stop(run.state()))
+                    if isinstance(stop, _TimedOut):
+                        exceeded = BudgetExceeded(
+                            "wall_clock", run.budget.elapsed, run.budget.max_seconds
+                        )
+                        return await self._finish(
+                            run, EndReason.BUDGET_EXCEEDED, exceeded.message, exceeded
+                        )
                     if stop is not None:
                         return await self._finish(run, EndReason.STOPPED_BY_HOOK, stop)
                 case StopReason.END_TURN:
@@ -494,7 +528,11 @@ class AgentLoop(metaclass=_LoopMeta):
                         ErrorCategory.INTERNAL,
                         "the tool failed with an internal error and cannot be retried",
                     )
-        result = await self.after_tool(run.state(), call, result)
+        # `_CUT_OFF` on a stalled hook, never the unadjusted `result`: a subclass that redacts
+        # in `after_tool` must not have its redaction skipped because the clock ran out, which
+        # would send the very output it meant to remove. Fail closed.
+        adjusted = await self._hook(run, self.after_tool(run.state(), call, result))
+        result = _CUT_OFF if isinstance(adjusted, _TimedOut) else adjusted
 
         # Every sink takes the sanitised name, not just the fence and the log line. The event bus
         # is where 17.5's JSON-lines logger sits, and RunResult is what a caller reports on, so a
@@ -557,6 +595,29 @@ class AgentLoop(metaclass=_LoopMeta):
             budget_exceeded=exceeded,
             messages=tuple(run.messages),
         )
+
+    async def _hook[T](self, run: _Run, awaitable: Awaitable[T]) -> T | _TimedOut:
+        """Run one extension hook under the run's remaining wall clock.
+
+        A hook is a subclass's own async code and part of the run's work, unlike an observer,
+        which only reports -- so it is bounded by the budget it could otherwise outlive rather
+        than by a fixed ceiling. `before_model`, `after_tool` and `should_stop` are all awaited
+        outside the model-call and per-tool scopes, so without this a stalled hook kept `run()`
+        pending for ever with `max_seconds` set. Found by Codex on 2026-11-21.
+
+        Returns `_HOOK_TIMED_OUT` when the clock ran out inside the hook; each caller degrades,
+        because what is safe to do next differs by site.
+        """
+        remaining = run.budget.remaining_seconds
+        allowance = remaining if remaining > 0.0 else HOOK_GRACE_SECONDS
+        try:
+            async with asyncio.timeout(allowance) as scope:
+                return await awaitable
+        except TimeoutError:
+            if scope.expired():
+                _log.warning("an extension hook exceeded its %ss allowance", allowance)
+                return _HOOK_TIMED_OUT
+            raise
 
     async def _publish(
         self,

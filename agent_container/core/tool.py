@@ -254,7 +254,9 @@ def has_write_gate(tool: AnyTool) -> bool:
 
     A gate must also *wrap* something. Without that, a write tool could set `gates_writes = True`
     on itself and approve its own writes; a decorator always has something beneath it, and a leaf
-    never does, so `wrapped is not None` separates the two with no cooperation from the author.
+    never does. This catches the accidental case and nothing more: an author set on evading it can
+    return a throwaway tool from `wrapped`, or more cheaply just declare `Effect.READ`, which no
+    check here has ever claimed to catch. The gate check guards mistakes, not the tool's author.
     """
     return any(
         getattr(member, GATE_MARKER, False) is True and member.wrapped is not None

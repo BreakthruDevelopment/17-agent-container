@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import functools
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import pytest
 
@@ -648,6 +649,87 @@ async def test_an_event_cannot_be_modified_by_a_subscriber() -> None:
         rec.events[0].kind = LoopEventKind.TOOL_FAILED  # type: ignore[misc]  # frozen on purpose
 
 
+class OwnTimeout:
+    """An observer that raises TimeoutError itself, rather than stalling."""
+
+    async def on_event(self, event: LoopEvent) -> None:
+        raise TimeoutError("my own problem, not a stall")
+
+
+async def test_an_observers_own_timeouterror_is_not_reported_as_a_stall(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Without the `scope.expired()` check these two cases log the same line, and a subscriber bug
+    # reads as the loop having cut it off.
+    with caplog.at_level("WARNING"):
+        await loop(scripted(ModelResponse.of("x")), observers=[OwnTimeout()]).run("go", Budget())
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("failed on" in m and "TimeoutError" in m for m in messages)
+    assert not any("timed out after" in m for m in messages)
+
+
+# -- an extension hook cannot outlive the budget --------------------------------------------------
+#
+# `before_model`, `after_tool` and `should_stop` are awaited outside the model-call and per-tool
+# scopes, so without their own bound a stalled hook kept `run()` pending for ever.
+
+
+async def test_a_stalled_before_model_ends_the_run_on_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agent_container.core.loop.HOOK_GRACE_SECONDS", 0.01)
+
+    class Stalls(_RealLoop):
+        async def before_model(self, state: RunState, request: ModelRequest) -> ModelRequest:
+            await asyncio.Event().wait()
+            return request
+
+    built = Stalls(scripted(ModelResponse.of("x")), [], system_prompt="s", fence_nonce=NONCE)
+    result = await asyncio.wait_for(built.run("go", Budget(max_seconds=0.01)), timeout=5.0)
+    assert result.end_reason is EndReason.BUDGET_EXCEEDED
+
+
+async def test_a_stalled_should_stop_ends_the_run_on_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agent_container.core.loop.HOOK_GRACE_SECONDS", 0.01)
+
+    class Stalls(_RealLoop):
+        async def should_stop(self, state: RunState) -> str | None:
+            await asyncio.Event().wait()
+            return None
+
+    provider = scripted(use_tool(tool_call()), ModelResponse.of("x"))
+    built = Stalls(provider, [EchoTool()], system_prompt="s", fence_nonce=NONCE)
+    result = await asyncio.wait_for(built.run("go", Budget(max_seconds=0.01)), timeout=5.0)
+    assert result.end_reason is EndReason.BUDGET_EXCEEDED
+
+
+async def test_a_stalled_after_tool_falls_back_to_the_cut_off_not_the_raw_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A subclass that redacts in `after_tool` must not have its redaction skipped because the
+    # clock ran out: that would send the very output it meant to remove.
+    class Redactor(_RealLoop):
+        async def after_tool(
+            self, state: RunState, call: ToolUseBlock, result: ToolResult
+        ) -> ToolResult:
+            await asyncio.Event().wait()
+            return ToolResult.ok("redacted")
+
+    sensitive = "PII-tool-output-that-must-not-ship"
+    echo = EchoTool(lambda _: ToolResult.ok(sensitive))
+    provider = scripted(use_tool(tool_call()), ModelResponse.of("x"))
+    built = Redactor(provider, [echo], system_prompt="s", fence_nonce=NONCE)
+    # A real remaining clock, not the grace: the hook gets what is left of the budget and is cut
+    # off by it, which is the case a redacting subclass would actually hit.
+    result = await asyncio.wait_for(built.run("go", Budget(max_seconds=0.2)), timeout=5.0)
+    # The recorded transcript is what a resumed run would resend, so the secret must not be in it.
+    transcript = repr(result.messages)
+    assert sensitive not in transcript
+    assert any("cut off" in repr(m).lower() or "budget" in repr(m).lower() for m in result.messages)
+
+
 # -- a write tool needs a gate, at construction ---------------------------------------------------
 #
 # `AGENTS.md`: "an `effect: write` tool without a `PermissionGate` anywhere in its stack is a
@@ -715,8 +797,21 @@ async def test_the_tool_registry_cannot_be_added_to_after_construction() -> None
     # The gate check runs once, at construction; a tool inserted afterwards would have passed
     # nothing on its way to the model.
     built = loop(scripted(ModelResponse.of("x")), EchoTool())
+    gated = FakeGate[EchoArgs](DeleteTool())
     with pytest.raises(TypeError):
-        built._tools["delete"] = DeleteTool()  # type: ignore[index]  # read-only on purpose
+        built._tools["delete"] = gated  # type: ignore[index]  # read-only on purpose
+    # Not just `__setitem__`: a dict subclass blocking only that would pass a narrower test.
+    mutations: tuple[Callable[[Any], object], ...] = (
+        lambda m: m.update({"delete": gated}),
+        lambda m: m.setdefault("delete", gated),
+        lambda m: m.pop("echo"),
+        lambda m: m.clear(),
+        lambda m: m.__delitem__("echo"),
+        lambda m: m.popitem(),
+    )
+    for mutate in mutations:
+        with pytest.raises((TypeError, AttributeError)):
+            mutate(built._tools)
 
 
 async def test_a_read_tool_needs_no_gate() -> None:
