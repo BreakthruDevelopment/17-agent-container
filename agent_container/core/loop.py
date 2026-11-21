@@ -231,7 +231,21 @@ class AgentLoop:
 
     def __init_subclass__(cls) -> None:
         super().__init_subclass__()
-        overridden = [name for name in _SKELETON if name in cls.__dict__]
+        # Compare what the MRO *resolves*, not what this class *declares*. `name in cls.__dict__`
+        # misses `class MyAgent(SomeBase, AgentLoop)`, where a base ordered before AgentLoop
+        # supplies the method instead -- which is how a cross-cutting mixin is normally written,
+        # so it needs no intent to circumvent. Measured before this change: such a subclass was
+        # accepted and the model received unfenced tool output with RunResult.tool_calls empty.
+        overridden = [
+            name
+            for name in _SKELETON
+            if getattr(cls, name, None) is not getattr(AgentLoop, name, None)
+        ]
+        # The guard itself is part of the skeleton: a subclass defining its own
+        # `__init_subclass__` without calling super() would disable it for every descendant.
+        # It is an implicit classmethod, so enumerating functions on the class does not list it.
+        if "__init_subclass__" in cls.__dict__:
+            overridden.append("__init_subclass__")
         if overridden:
             raise TypeError(
                 f"{cls.__name__} overrides the loop skeleton ({', '.join(overridden)}); "

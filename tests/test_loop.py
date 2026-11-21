@@ -389,6 +389,90 @@ async def test_oversized_tool_output_is_cut() -> None:
 # -- template method -----------------------------------------------------------------------------
 
 
+def test_every_private_method_is_in_the_skeleton() -> None:
+    """The check that would have caught `_record`, and will catch the next extraction.
+
+    Round 9 found that pulling block-building out of `_run_tool` into a new `_record` moved the
+    fence, the name sanitisation and the event publishing out of the guard, because nothing added
+    the new name to `_SKELETON`. Listing the names by hand is what failed; this derives them.
+
+    The rule: a private method on `AgentLoop` is part of the skeleton. The public surface is
+    `__init__`, `run` (skeleton) and the three hooks a subclass may override. Anything else
+    private must be guarded, or a subclass can replace it.
+    """
+    import inspect
+
+    hooks = {"before_model", "after_tool", "should_stop"}
+    private = {
+        name
+        for name, value in vars(AgentLoop).items()
+        if inspect.isfunction(value) and name.startswith("_") and not name.startswith("__")
+    }
+    missing = sorted(private - set(_SKELETON))
+    assert not missing, f"private methods not in _SKELETON: {missing}"
+
+    public = {
+        name
+        for name, value in vars(AgentLoop).items()
+        if inspect.isfunction(value) and not name.startswith("_")
+    }
+    assert public == hooks | {"run"}, f"unexpected public surface: {sorted(public - hooks)}"
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(
+            lambda: type("Declares", (AgentLoop,), {"_record": lambda self, *a: None}),
+            id="declares-it",
+        ),
+        pytest.param(
+            lambda: type(
+                "ViaMixin",
+                (type("M", (), {"_record": lambda self, *a: None}), AgentLoop),
+                {},
+            ),
+            id="mixin-ordered-first",
+        ),
+        pytest.param(
+            lambda: type(
+                "RunViaMixin",
+                (type("M2", (), {"run": lambda self, *a: None}), AgentLoop),
+                {},
+            ),
+            id="mixin-replaces-run",
+        ),
+        pytest.param(
+            lambda: type(
+                "OwnGuard",
+                (AgentLoop,),
+                {"__init_subclass__": classmethod(lambda cls: None)},
+            ),
+            id="disables-the-guard-itself",
+        ),
+    ],
+)
+def test_the_skeleton_cannot_be_replaced_through_any_door(make: object) -> None:
+    """`name in cls.__dict__` only sees what the class declares.
+
+    A base ordered before `AgentLoop` supplies the method instead, which is how a cross-cutting
+    mixin is normally written -- no intent to circumvent needed. Measured before the fix: such a
+    subclass was accepted and the model received unfenced tool output.
+    """
+    with pytest.raises(TypeError, match="skeleton"):
+        make()  # type: ignore[operator]
+
+
+def test_a_plain_subclass_is_still_allowed() -> None:
+    """The guard must not make the hooks unusable."""
+
+    class Fine(AgentLoop):
+        async def should_stop(self, state: RunState) -> str | None:
+            return None
+
+    assert Fine is not None
+
+
 def test_run_is_final_and_the_skeleton_cannot_be_overridden() -> None:
     assert getattr(AgentLoop.run, "__final__", False)
     # Iterate the real tuple, not a copy of it: a second list is why adding `_record` to the
