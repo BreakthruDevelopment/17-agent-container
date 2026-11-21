@@ -24,9 +24,10 @@ Role = Literal["user", "assistant"]
 class StopReason(StrEnum):
     """Every Bedrock Converse `stopReason` the loop has a decision for.
 
-    Converse also defines newer values (`malformed_model_output`, `malformed_tool_use`,
-    `model_context_window_exceeded`). They are deliberately absent: the spec lists these six, and a
-    seventh must be decided on, in this enum and in the loop, not defaulted. Until then it raises.
+    The first six are the ones the spec lists; the last three are the newer Converse values
+    (`malformed_model_output`, `malformed_tool_use`, `model_context_window_exceeded`), added in 17.3
+    with a branch each in the loop. The list is closed on purpose: a value that is not here must be
+    decided on, in this enum and in the loop, never defaulted, so `parse` raises on it.
     """
 
     END_TURN = "end_turn"
@@ -35,6 +36,9 @@ class StopReason(StrEnum):
     STOP_SEQUENCE = "stop_sequence"
     GUARDRAIL_INTERVENED = "guardrail_intervened"
     CONTENT_FILTERED = "content_filtered"
+    MALFORMED_MODEL_OUTPUT = "malformed_model_output"
+    MALFORMED_TOOL_USE = "malformed_tool_use"
+    MODEL_CONTEXT_WINDOW_EXCEEDED = "model_context_window_exceeded"
 
     @classmethod
     def parse(cls, value: str) -> StopReason:

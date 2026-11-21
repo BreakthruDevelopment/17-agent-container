@@ -5,6 +5,7 @@ description = "A reusable agent core: loop, model providers, tool contracts, per
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "boto3>=1.35,<2",
     "pydantic>=2.9,<3",
 ]
 
@@ -42,6 +43,12 @@ strict = true
 python_version = "3.12"
 files = ["agent_container", "tests"]
 warn_unreachable = true
+
+# boto3 and botocore ship no type information; `bedrock.py` is the only importer and wraps the client
+# in the typed `ConverseClient` protocol straight away.
+[[tool.mypy.overrides]]
+module = ["boto3", "botocore", "botocore.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
