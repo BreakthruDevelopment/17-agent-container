@@ -368,3 +368,18 @@ def test_a_string_effect_write_tool_behind_a_gate_constructs() -> None:
     gated = PermissionGate(StringEffectTool())
     loop = _builder(gated).build()
     assert loop is not None
+
+
+def test_a_yaml_syntax_error_does_not_echo_the_manifest() -> None:
+    """`load_manifest` promises values are not echoed. `str(YAMLError)` embeds a source excerpt.
+
+    A malformed manifest leaked whatever sat near the error -- here a system prompt. The
+    message keeps the parser's own problem description and position, neither of which
+    contains document text.
+    """
+    marker = "MARKER-do-not-echo-abc123"
+    with pytest.raises(ManifestError) as caught:
+        load_manifest(f'system_prompt: "{marker}" trailing-token\n')
+    message = str(caught.value)
+    assert marker not in message, f"manifest text leaked into the error: {message!r}"
+    assert "line" in message and "column" in message, message

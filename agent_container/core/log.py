@@ -60,14 +60,24 @@ def configure_json_lines_logging(
 ) -> logging.Logger:
     """Attach a message-only handler so each info record is one JSON line.
 
+    The default sink is stdout, not stderr. Routing was not the whole problem: the bus and the
+    loop write diagnostics to stderr through root logging or `lastResort`, so a default that
+    also wrote JSON there still interleaved a bare sentence between two JSON objects, whatever
+    logger it came from. Data on stdout, diagnostics on stderr, keeps the stream parseable.
+
     Safe to call more than once for the same stream: a second call does not add another
     handler. `propagate` is turned off so a root formatter cannot wrap the line in a
     timestamp and break JSON-lines.
     """
     log = logger or logging.getLogger(EVENTS_LOGGER)
-    target = sys.stderr if stream is None else stream
+    target = sys.stdout if stream is None else stream
     for handler in log.handlers:
         if isinstance(handler, logging.StreamHandler) and handler.stream is target:
+            # Set the formatter even on a handler we did not attach. The host application may
+            # have configured this stream with its own (`PREFIX %(message)s`), and returning
+            # without replacing it meant this function advertised JSON-lines and did not
+            # deliver it -- every line prefixed, nothing parseable.
+            handler.setFormatter(JsonLinesFormatter())
             log.setLevel(logging.INFO)
             log.propagate = False
             return log

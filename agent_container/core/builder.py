@@ -92,11 +92,20 @@ class Manifest(BaseModel):
 
 
 def load_manifest(text: str) -> Manifest:
-    """Parse a YAML document into a `Manifest`. Values are not echoed in the error."""
+    """Parse a YAML document into a `Manifest`. Values are not echoed in the error.
+
+    That promise held for the validation path (`include_input=False`) and not for this one:
+    `str(YAMLError)` embeds a source excerpt, so a malformed manifest leaked whatever sat near
+    the error -- a `system_prompt`, a credential pasted into one. Only the parser's own problem
+    description and position are safe to repeat; neither contains document text.
+    """
     try:
         loaded: object = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise ManifestError(f"manifest is not valid YAML: {exc}") from exc
+        problem = getattr(exc, "problem", None) or "could not be parsed"
+        mark = getattr(exc, "problem_mark", None)
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise ManifestError(f"manifest is not valid YAML: {problem}{where}") from exc
     if loaded is None:
         raise ManifestError("manifest is empty")
     if not isinstance(loaded, dict):

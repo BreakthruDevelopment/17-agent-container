@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import sys
 
 from agent_container.core import (
     LOG_FIELDS,
@@ -150,3 +151,39 @@ async def test_a_failing_subscriber_does_not_corrupt_the_json_lines_stream() -> 
         if line.strip():
             json.loads(line)  # raises if the warning landed here
     assert "subscriber" not in text, f"bus diagnostics reached the JSON stream: {text!r}"
+
+
+def test_an_existing_handler_for_the_stream_is_given_the_json_formatter() -> None:
+    """The host app may already have a handler on this stream, with its own formatter.
+
+    `configure_json_lines_logging` reused it and returned without replacing the formatter, so
+    it advertised JSON-lines and delivered `PREFIX {...}` -- nothing on the stream parsed.
+    """
+    stream = io.StringIO()
+    logger = logging.getLogger(EVENTS_LOGGER + ".preconfigured")
+    preexisting = logging.StreamHandler(stream)
+    preexisting.setFormatter(logging.Formatter("PREFIX %(message)s"))
+    logger.addHandler(preexisting)
+    try:
+        configure_json_lines_logging(stream, logger=logger)
+        logger.info('{"run_id":"r","turn":1,"tool":null,"outcome":"x","tokens":0,"duration":0.0}')
+        for line in stream.getvalue().splitlines():
+            if line.strip():
+                json.loads(line)  # raises if the host's formatter survived
+        assert "PREFIX" not in stream.getvalue()
+    finally:
+        logger.handlers.clear()
+        logger.propagate = True
+
+
+def test_the_default_sink_is_not_the_stream_diagnostics_go_to() -> None:
+    """Data on stdout, diagnostics on stderr. A shared default interleaved them."""
+    logger = logging.getLogger(EVENTS_LOGGER + ".defaultsink")
+    try:
+        configure_json_lines_logging(logger=logger)
+        streams = [h.stream for h in logger.handlers if isinstance(h, logging.StreamHandler)]
+        assert streams, "no handler attached"
+        assert all(s is not sys.stderr for s in streams), "the default sink is stderr again"
+    finally:
+        logger.handlers.clear()
+        logger.propagate = True
