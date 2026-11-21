@@ -24,7 +24,9 @@ from agent_container.core.tool import (
     Tool,
     ToolContext,
     ToolResult,
+    has_write_gate,
     walk_stack,
+    writes,
 )
 
 
@@ -149,6 +151,13 @@ class Cached[A: BaseModel](Decorator[A]):
     stored until a call finishes, so a cancelled call leaves no entry. `max_entries` bounds
     memory (least recently used goes first); `ttl` seconds bounds age, off by default.
 
+    A cache must not sit over a write that has no gate beneath it. It would remember the applied
+    success and answer every later approval of the same call from memory, so a person approves a
+    transfer, `apply()` reports success, and nothing ran. That covers
+    `PermissionGate(Cached(write))` and a bare `Cached(write)` alike, and construction refuses
+    it. `Cached(PermissionGate(write))` is fine: the gate is beneath,
+    and a staged result is never stored.
+
     A hit returns without running anything beneath, so a `TurnOutputCap` beneath a `Cached` would
     never see the delivered result and the cap would be bypassed. Construction refuses that;
     put the cap outside the cache, where it charges every result, hits included.
@@ -167,6 +176,11 @@ class Cached[A: BaseModel](Decorator[A]):
         key_for: Callable[[Identity], Hashable] = identity_key,
     ) -> None:
         super().__init__(inner)
+        if writes(inner) and not has_write_gate(inner):
+            raise ValueError(
+                "a Cached over a write with no permission gate beneath it would answer a "
+                "repeated, approved write from memory; use Cached(PermissionGate(write))"
+            )
         if stack_caps_output(inner):
             raise ValueError(
                 "a TurnOutputCap beneath a Cached is bypassed by cache hits; put it outside"

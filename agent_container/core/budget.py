@@ -100,8 +100,11 @@ class Budget:
         the number of *leaf* budgets running at once, minus one -- every budget that actually
         makes calls, at any depth, not the number of direct children: one child with eight
         grandchildren overshoots as much as nine siblings would. Tokens and seconds overshoot by
-        whatever the in-flight calls spend or take, which has no bound here. A coordinator that
-        needs a hard turn cap must limit how many subagents run at once.
+        whatever the in-flight calls spend or take, which has no bound here, and that is true of
+        a plain `Budget` with no children too: check-then-spend is how every budget works. What
+        `child()` adds is a multiplier, the number of concurrent leaves. The mitigation is the
+        same for turns and tokens: a coordinator that needs a hard cap must limit how many
+        subagents run at once, and for tokens must also cap the size of each call.
         """
         return Budget(
             max_turns=self.max_turns if max_turns is None else max_turns,

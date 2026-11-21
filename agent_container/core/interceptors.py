@@ -104,8 +104,9 @@ class TurnOutputCap(Interceptor):
     top. Charging is synchronous (no `await` between reading and updating the total), so
     concurrent calls cannot both be admitted on the same remaining room. Turns of a run are
     tracked in an LRU of `max_runs` runs; a run evicted by more than that many concurrent runs
-    starts its turn's count again; that is a memory-for-accuracy trade, not closed by anything
-    else here.
+    starts its turn's count again, so that run can inject past the cap. This needs no cache or
+    any other decorator in the stack: it is the bound itself, a memory-for-accuracy trade that
+    nothing else here closes.
 
     Stack order is enforced, not advised: `truncates_output` makes `Redacting` and `Cached`
     refuse to be built over a stack holding a cap (a cut can split a secret before it is

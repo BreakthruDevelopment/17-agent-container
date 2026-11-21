@@ -169,7 +169,7 @@ def test_a_gate_is_found_anywhere_in_the_stack() -> None:
     assert has_write_gate(cached)
     metered = Metered(cached, Metrics())
     assert has_write_gate(metered)
-    ungated = Cached(Metered(write, Metrics()))
+    ungated = Metered(Metered(write, Metrics()), Metrics())
     assert not has_write_gate(ungated)
 
 
@@ -179,7 +179,7 @@ def test_the_loop_accepts_a_gated_write_under_cached_and_rejects_an_ungated_one(
 
     gated = Cached(PermissionGate(CountingWrite()))
     build(gated)
-    bare = Cached(Metered(CountingWrite(), Metrics()))
+    bare = Metered(Metered(CountingWrite(), Metrics()), Metrics())
     with pytest.raises(ValueError, match="no permission gate"):
         build(bare)
 
@@ -691,3 +691,48 @@ class TestFullStackContract(_Contract):
 def test_effect_is_inherited_through_the_full_stack() -> None:
     stack = TestFullStackContract().make_tool()
     assert stack.effect == Effect.WRITE
+
+
+# -- an approved write must run: nothing may swallow it ------------------------------------------
+
+
+def test_a_cache_over_an_ungated_write_is_refused_whatever_sits_in_between() -> None:
+    write = CountingWrite()
+    with pytest.raises(ValueError, match="no permission gate beneath"):
+        Cached(write)
+    metered = Metered(write, Metrics())
+    with pytest.raises(ValueError, match="no permission gate beneath"):
+        Cached(metered)
+    with pytest.raises(ValueError, match="no permission gate beneath"):
+        PermissionGate(Cached(Retrying(write)))
+    Cached(EchoTool())  # a cache over a read is fine
+
+
+async def test_each_approval_through_a_cached_gate_runs_the_write() -> None:
+    write = CountingWrite()
+    tool = Cached(PermissionGate(write))  # the arrangement the spec blesses
+    for _ in range(3):
+        staged = (await tool.run(EchoArgs(text="transfer"), ctx())).staged
+        assert staged is not None
+        await staged.apply()
+    assert write.writes == ["transfer"] * 3
+
+
+def test_a_staging_gate_cannot_be_nested() -> None:
+    with pytest.raises(ValueError, match="already behind a staging gate"):
+        PermissionGate(PermissionGate(CountingWrite()))
+    with pytest.raises(ValueError, match="already behind a staging gate"):
+        PermissionGate(Metered(PermissionGate(CountingWrite()), Metrics()))
+
+
+async def test_apply_never_reports_success_for_a_result_it_did_not_execute() -> None:
+    class Stages(CountingWrite):
+        async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+            return await PermissionGate(CountingWrite()).run(args, ctx)  # staged, not run
+
+    staged = (await PermissionGate(Stages()).run(EchoArgs(text="x"), ctx())).staged
+    assert staged is not None
+    with pytest.raises(StagedChangeError, match="not executed"):
+        await staged.apply()
+    with pytest.raises(StagedChangeError, match="already"):  # the approval is spent, and says so
+        await staged.apply()

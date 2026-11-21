@@ -14,6 +14,7 @@ from agent_container.core.tool import (
     Tool,
     ToolContext,
     ToolResult,
+    walk_stack,
     writes,
 )
 
@@ -54,6 +55,13 @@ class ToolCallChange[A: BaseModel](StagedChange):
             raise StagedChangeError("this change has already been applied or attempted")
         self._attempted = True
         result = await self._tool.run(self._args, self._ctx)
+        if result.staged is not None:
+            # A result that only stages another change was not executed. Reporting success here
+            # would lose an approval silently, and `_attempted` is already set.
+            raise StagedChangeError(
+                f"{self._tool.name} was not executed: applying it produced another staged "
+                "change instead of running. This approval is spent; nothing was done."
+            )
         if result.is_error:
             raise StagedChangeError(
                 f"{self._tool.name} failed when applied ({result.error_category}): {result.content}"
@@ -87,6 +95,12 @@ class PermissionGate[A: BaseModel](Decorator[A]):
         self.requires = requires
         if self.policy == Policy.READ and writes(inner):
             raise ValueError(f"policy 'read' cannot gate {inner.name!r}: it writes")
+        if self.policy == Policy.STAGED_WRITE and any(
+            getattr(member, "policy", None) == Policy.STAGED_WRITE for member in walk_stack(inner)
+        ):
+            # Applying the outer change would only stage the inner one: an approval that does
+            # nothing. One staging gate per stack.
+            raise ValueError(f"{inner.name!r} is already behind a staging gate; do not nest them")
         if self.policy == Policy.STAGED_WRITE and not writes(inner):
             raise ValueError(f"policy 'staged_write' needs a writing tool; {inner.name!r} reads")
 
