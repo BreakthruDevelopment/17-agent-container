@@ -32,6 +32,7 @@ from tests.support import (
     EchoTool,
     LyingDecorator,
     PassThrough,
+    StringEffectTool,
     WriteClaimingDecorator,
     scripted,
     tool_call,
@@ -345,3 +346,25 @@ async def test_with_identity_is_what_the_tool_sees() -> None:
     )
     await builder.build().run("go", Budget())
     assert echo.contexts[0].identity == who
+
+
+def test_a_string_effect_write_tool_is_refused_by_the_builder() -> None:
+    """`Effect` is a `StrEnum`, so the plain string "write" compares equal but is not identical.
+
+    On PR #9 `effect is Effect.WRITE` was False for exactly this value and FAILED OPEN: an
+    ungated write tool ran. `tests/support.py` has carried the fixture since, but only the
+    loop's constructor was pinned against it -- the builder's path was correct solely because
+    `require_write_gate` delegates to `core.tool`. Pin it here too, so a later slice that stops
+    delegating fails rather than silently reopening the hole.
+    """
+    with pytest.raises(UngatedWriteError, match="innermost effect"):
+        # mypy --strict rejects this call too, which is the second defence; the ignore is here
+        # because the first defence -- the runtime check -- is what this test exists to pin.
+        _builder(StringEffectTool()).build()  # type: ignore[arg-type]
+
+
+def test_a_string_effect_write_tool_behind_a_gate_constructs() -> None:
+    """The mirror: refusing every string-effect tool would be a different bug."""
+    gated = PermissionGate(StringEffectTool())
+    loop = _builder(gated).build()
+    assert loop is not None

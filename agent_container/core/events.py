@@ -18,7 +18,12 @@ from collections.abc import Sequence
 
 from agent_container.core.loop import LoopEvent, LoopEventKind, LoopObserver
 
-_log = logging.getLogger("agent_container.events")
+# NOT "agent_container.events", and deliberately not a child of it. `log.py` attaches the
+# JSON-lines handler to "agent_container.events" (EVENTS_LOGGER), and a child's records
+# propagate to an ancestor's handlers -- so "agent_container.events.bus" would land this
+# diagnostic in the JSON stream just the same. A sibling keeps the stream parseable;
+# `loop.py` uses "agent_container.loop" for the same reason.
+_log = logging.getLogger("agent_container.bus")
 
 # The four events named in the public interface, in the order a typical turn emits them.
 # `BudgetExceeded` the event kind lives here; `BudgetExceeded` the budget report is a

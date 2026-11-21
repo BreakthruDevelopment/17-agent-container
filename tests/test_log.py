@@ -120,3 +120,33 @@ def test_configure_json_lines_logging_is_idempotent_for_the_same_stream() -> Non
     logger.info("%s", '{"run_id":"r"}')
     assert stream.getvalue() == '{"run_id":"r"}\n'
     logger.handlers.clear()
+
+
+async def test_a_failing_subscriber_does_not_corrupt_the_json_lines_stream() -> None:
+    """The bus's own diagnostics must not land in the stream they describe.
+
+    `events.py` logged its subscriber-failure warning to EVENTS_LOGGER, the same logger
+    `configure_json_lines_logging` attaches the message-only handler to, so one failing
+    subscriber put a bare sentence between two JSON objects. Every line must parse.
+
+    A child logger would not fix it: records propagate to an ancestor's handlers, so
+    "agent_container.events.bus" would reach the same handler. The bus logs to a sibling.
+    """
+    stream = io.StringIO()
+    configure_json_lines_logging(stream)
+
+    class Boom:
+        async def on_event(self, event: LoopEvent) -> None:
+            raise RuntimeError("boom")
+
+    bus = EventBus()
+    bus.subscribe(Boom())
+    bus.subscribe(JsonLinesSubscriber(stream=None))
+    event = LoopEvent(kind=LoopEventKind.MODEL_CALLED, run_id="r", turn=1)
+    await bus.on_event(event)
+
+    text = stream.getvalue()
+    for line in text.splitlines():
+        if line.strip():
+            json.loads(line)  # raises if the warning landed here
+    assert "subscriber" not in text, f"bus diagnostics reached the JSON stream: {text!r}"
