@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import traceback
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -374,8 +375,9 @@ def test_a_yaml_syntax_error_does_not_echo_the_manifest() -> None:
     """`load_manifest` promises values are not echoed. `str(YAMLError)` embeds a source excerpt.
 
     A malformed manifest leaked whatever sat near the error -- here a system prompt. The
-    message keeps the parser's own problem description and position, neither of which
-    contains document text.
+    message keeps the parser's own problem description and position. `problem` is safe for
+    whole VALUES -- what the promise covers -- though a few of PyYAML's problem strings do
+    repeat a YAML identifier, and the scanner echoes one character from inside a quoted scalar.
     """
     marker = "MARKER-do-not-echo-abc123"
     with pytest.raises(ManifestError) as caught:
@@ -412,4 +414,43 @@ def test_a_tagged_scalar_does_not_echo_the_manifest(document: str) -> None:
     assert marker.lower() not in message.lower(), f"manifest text leaked: {message!r}"
     # The cause is suppressed too, or the value returns in the traceback (PR #12's finding).
     assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None or marker not in str(caught.value.__context__)
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        'system_prompt: "{marker}"',  # model missing -> "Field required"
+        'model: [1, 2]\nsystem_prompt: "{marker}"',  # wrong type
+        'model: m\nsystem_prompt: "{marker}"\ntools: not-a-list',
+    ],
+)
+def test_a_validation_error_does_not_echo_the_manifest(document: str) -> None:
+    """The ordinary error path leaked too, and by a different route than the YAML one.
+
+    `include_input=False` sanitizes the string we extract from `exc.errors()` and does nothing
+    to the `ValidationError`, so `from exc` re-attached the whole input: `str(exc)` renders
+    `input_value={'system_prompt': '<credential>'}`. Pydantic truncates to roughly 25 head and
+    25 tail characters, so a short secret comes back verbatim. This is not a hostile-document
+    path -- any missing field or typo reaches it.
+    """
+    marker = "MARKER-do-not-echo-abc123"
+    with pytest.raises(ManifestError) as caught:
+        load_manifest(document.format(marker=marker) + "\n")
+    message = str(caught.value)
+    assert marker not in message, f"manifest text leaked: {message!r}"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert marker not in rendered, "manifest text leaked into the rendered traceback"
+
+
+def test_invalid_limits_do_not_echo_the_values() -> None:
+    """`with_limits` had the same `from exc` shape, with the rejected numbers in the chain."""
+    with pytest.raises(ManifestError) as caught:
+        AgentBuilder().with_limits(max_turns=-99_777_333)
+    assert "99_777_333".replace("_", "") not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None

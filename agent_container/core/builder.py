@@ -94,7 +94,11 @@ class Manifest(BaseModel):
 def load_manifest(text: str) -> Manifest:
     """Parse a YAML document into a `Manifest`. Values are not echoed in the error.
 
-    That promise held for the validation path (`include_input=False`) and not for this one:
+    Both paths leaked, by different routes. The validation path passes `include_input=False`,
+    which sanitizes the string we extract and does nothing to the `ValidationError` itself, so
+    chaining it with `from exc` re-attached the input; `str(ValidationError)` renders
+    `input_value=` with the offending value (pydantic truncates to roughly 25 head + 25 tail
+    characters, so anything shorter than that is verbatim). On this path
     `str(YAMLError)` embeds a source excerpt -- `Mark.__str__` calls `get_snippet()`, up to 75
     characters of the buffer -- so a malformed manifest leaked whatever sat near the error: a
     `system_prompt`, a credential pasted into one. Reading `.line`/`.column` off the mark
@@ -135,7 +139,7 @@ def load_manifest(text: str) -> Manifest:
     except Exception as exc:
         # `SafeConstructor`'s scalar conversions raise plain builtins with the value in the
         # message, so `except YAMLError` alone let the opening case straight through.
-        failure = f"a tagged scalar could not be converted ({type(exc).__name__})"
+        failure = f"could not be parsed ({type(exc).__name__})"
     if failure is not None:
         raise ManifestError(f"manifest is not valid YAML: {failure}")
     if loaded is None:
@@ -146,14 +150,19 @@ def load_manifest(text: str) -> Manifest:
 
 
 def manifest_from_mapping(data: Mapping[str, object]) -> Manifest:
+    invalid: str | None = None
     try:
         return Manifest.model_validate(data)
     except ValidationError as exc:
-        problems = "; ".join(
+        # Build the message in here and raise OUTSIDE the handler. `from exc` would attach the
+        # ValidationError as `__cause__`, and `include_input=False` only sanitizes the string
+        # extracted above -- `str(exc)` still renders `input_value=<the manifest>`. Raising in
+        # here would set `__context__` to the same object even with `from None`.
+        invalid = "; ".join(
             f"{'.'.join(str(p) for p in e['loc']) or 'manifest'}: {e['msg']}"
             for e in exc.errors(include_url=False, include_input=False)
         )
-        raise ManifestError(f"invalid manifest: {problems}") from exc
+    raise ManifestError(f"invalid manifest: {invalid}")
 
 
 def require_write_gate(tool: AnyTool) -> None:
@@ -244,9 +253,12 @@ class AgentBuilder:
                 max_tokens=self._limits.max_tokens if max_tokens is None else max_tokens,
                 max_seconds=self._limits.max_seconds if max_seconds is None else max_seconds,
             )
-        except ValidationError as exc:
-            raise ManifestError("invalid limits") from exc
-        return self
+            return self
+        except ValidationError:
+            # Raised outside for the reason given in `load_manifest`: chaining re-attaches the
+            # rejected values. The message carries none, so there is nothing to extract.
+            pass
+        raise ManifestError("invalid limits")
 
     def with_permissions(self, permissions: Iterable[str], *, subject: str | None = None) -> Self:
         self._permissions = frozenset(permissions)
