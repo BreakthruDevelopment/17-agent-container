@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import io
 import traceback
 from dataclasses import FrozenInstanceError
@@ -28,6 +29,7 @@ from agent_container.core import (
     UngatedWriteError,
     load_manifest,
 )
+from agent_container.core.builder import _INDEXED_FIELDS
 from tests.support import (
     DeleteTool,
     EchoTool,
@@ -497,13 +499,89 @@ def test_our_own_validators_carry_no_values() -> None:
     `_describe_error` no longer passes `msg` through, so a careless validator added later
     cannot reopen the hole -- but the validators are kept value-free as well, because their
     `ValueError` is visible to anyone who validates a `Manifest` directly.
-    """
-    import re
 
-    source = Path("agent_container/core/builder.py").read_text()
-    body = source.split("def load_manifest")[0]
-    for raised in re.findall(r"raise ValueError\((.+?)\)\n", body):
-        assert not raised.lstrip().startswith("f"), f"validator interpolates a value: {raised}"
+    Parsed rather than grepped. The first version of this test searched a positional window
+    for `raise ValueError(f...`, which held every validator only by accident and caught just
+    one of the eight ways to get a value into a string: `"x" + value`, `.format()`, `%`,
+    `str(value)`, implicit concatenation and a trailing comment all walked past it.
+    """
+    tree = ast.parse(Path("agent_container/core/builder.py").read_text())
+    validators = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            (isinstance(d, ast.Call) and getattr(d.func, "id", None) == "field_validator")
+            or getattr(d, "id", None) == "field_validator"
+            for d in node.decorator_list
+        )
+    ]
+    # Names, not a count: this also fails if a validator is renamed or dropped, rather than
+    # quietly checking fewer functions than it thinks.
+    assert {v.name for v in validators} == {"not_blank", "tool_names_are_identifiers"}, (
+        f"validators changed: {sorted(v.name for v in validators)}"
+    )
+    for validator in validators:
+        for node in ast.walk(validator):
+            if not isinstance(node, ast.Raise) or node.exc is None:
+                continue
+            raised = node.exc
+            if not (
+                isinstance(raised, ast.Call) and getattr(raised.func, "id", None) == "ValueError"
+            ):
+                continue
+            assert len(raised.args) == 1, f"{validator.name}: expected one argument"
+            argument = raised.args[0]
+            assert isinstance(argument, ast.Constant) and isinstance(argument.value, str), (
+                f"{validator.name} builds its message at runtime "
+                f"({type(argument).__name__}), so a value can reach it"
+            )
+
+
+def test_every_list_valued_field_is_indexable() -> None:
+    """An integer `loc` segment is an index only under a list field; elsewhere it is a KEY.
+
+    Pydantic keeps a mapping key as an int whenever it fits an i64, and `loc` does not say
+    which is which -- so `4111111111111111: x` rendered verbatim while every test passed. The
+    set is derived from the annotations; this pins what that derivation currently finds, so
+    adding a list field to the schema fails here rather than silently redacting its indices.
+    """
+    assert frozenset({"tools", "permissions"}) == _INDEXED_FIELDS
+
+
+@pytest.mark.parametrize(
+    ("label", "key"),
+    [
+        ("card-shaped", "4111111111111111"),
+        ("19 digits", "1234567890123456789"),
+        ("negative", "-4111111111111111"),
+        ("hex", "0xDEADBEEF"),
+        ("boolean", "true"),
+    ],
+)
+def test_a_numeric_unknown_key_is_redacted(label: str, key: str) -> None:
+    """These arrive in `loc` as `int`, not `str`, so `_KNOWN_FIELDS` never sees them."""
+    with pytest.raises(ManifestError) as caught:
+        load_manifest(f"model: m\nsystem_prompt: p\n{key}: x\n")
+    message = str(caught.value)
+    assert key not in message, f"{label}: numeric key leaked: {message!r}"
+    assert key.lstrip("-0x") not in message, f"{label}: numeric key leaked: {message!r}"
+    assert "<redacted>" in message, message
+
+
+def test_a_numeric_key_nested_under_a_known_field_is_redacted() -> None:
+    with pytest.raises(ManifestError) as caught:
+        load_manifest("model: m\nsystem_prompt: p\nlimits: {4111111111111111: x}\n")
+    assert "4111111111111111" not in str(caught.value), str(caught.value)
+    assert "limits.<redacted>" in str(caught.value), str(caught.value)
+
+
+@pytest.mark.parametrize("field", ["tools", "permissions"])
+def test_a_real_list_index_is_still_reported(field: str) -> None:
+    """The redaction must not cost the diagnostic the int branch existed for."""
+    with pytest.raises(ManifestError) as caught:
+        load_manifest(f"model: m\nsystem_prompt: p\n{field}: [1]\n")
+    assert f"{field}.0" in str(caught.value), str(caught.value)
 
 
 def test_unregistered_tool_names_are_not_echoed() -> None:

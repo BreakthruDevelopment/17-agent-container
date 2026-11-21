@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Self, TextIO
+from typing import Self, TextIO, get_args, get_origin
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -120,19 +120,58 @@ _ERROR_TEXT: dict[str, str] = {
     "less_than": "is above the permitted maximum",
     "too_long": "is too long",
     "too_short": "is too short",
+    "string_too_short": "must not be empty",
+    "model_type": "must be a mapping",
+    "int_from_float": "must be a whole number",
+    "invalid_key": "is not a usable key",
 }
+# Codes not in the table fall back to the raw pydantic code. That is safe -- the codes are a
+# closed literal set in pydantic-core, never input-derived -- but it reads as jargon, so the
+# four above were added after measuring which codes this schema can actually produce
+# (`model: ""` reported `string_too_short`, and a numeric key `invalid_key`). Entries for codes
+# the current schema cannot reach are kept deliberately, so adding a field does not regress
+# the wording.
+
+
+def _list_valued_fields(*models: type[BaseModel]) -> frozenset[str]:
+    """Fields whose value is a list, so an integer `loc` segment under them is an index.
+
+    Derived from the annotations rather than written out, so adding a list field to the schema
+    cannot silently turn its indices into `<redacted>` -- or, far worse, the reverse.
+    """
+    found: set[str] = set()
+    for model in models:
+        for name, field in model.model_fields.items():
+            candidates = (field.annotation, *get_args(field.annotation))
+            if any(get_origin(c) is list for c in candidates):
+                found.add(name)
+    return frozenset(found)
+
+
+# An integer `loc` segment is a list INDEX only directly inside one of these. Pydantic keeps a
+# mapping KEY as an int whenever it fits an i64, and nothing in `loc` distinguishes the two, so
+# treating every int as an index let an unknown numeric key through verbatim -- measured with
+# `4111111111111111: x`, which rendered in full, as did a 19-digit key, a negative one, and
+# `0xDEADBEEF` (as 3735928559). Larger ints and all floats pydantic stringifies, so those were
+# already caught by the `_KNOWN_FIELDS` arm.
+_INDEXED_FIELDS: frozenset[str] = _list_valued_fields(Manifest, Limits)
 
 
 def _describe_error(error: ErrorDetails) -> str:
     """Render one pydantic error with nothing in it that came from the document.
 
-    Both halves of the obvious one-liner are input-derived and `include_input=False` covers
-    neither: `loc` carries unknown KEYS, and `msg` carries whatever a validator interpolated.
+    Every part of the obvious one-liner is input-derived and `include_input=False` covers none
+    of it: `loc` carries unknown KEYS -- as strings, and as ints when they look like numbers --
+    and `msg` carries whatever a validator interpolated.
     """
-    where = ".".join(
-        str(part) if isinstance(part, int) else (part if part in _KNOWN_FIELDS else "<redacted>")
-        for part in error["loc"]
-    )
+    parts: list[str] = []
+    for position, part in enumerate(error["loc"]):
+        if isinstance(part, int):
+            parent = error["loc"][position - 1] if position else None
+            parts.append(str(part) if parent in _INDEXED_FIELDS else "<redacted>")
+        else:
+            parts.append(part if part in _KNOWN_FIELDS else "<redacted>")
+    where = ".".join(parts)
     code = error["type"]
     if code == "value_error":
         # One of our own validators. Their messages are value-free by construction (see
