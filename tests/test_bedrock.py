@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
 from collections.abc import Sequence
@@ -29,6 +28,8 @@ from agent_container.core.messages import TextBlock
 from agent_container.testing import ModelProviderContract, OverlapProbe
 from tests.support import StubConverseClient, to_wire
 
+# The autouse fixture replaces `make_client` per test; this is the real one, for the config tests.
+REAL_MAKE_CLIENT = bedrock_module.make_client
 MODEL = "anthropic.test-model-v1:0"
 
 
@@ -238,7 +239,11 @@ async def test_a_client_error_propagates_untouched() -> None:
 async def test_the_lazy_client_is_built_on_a_worker_thread_not_the_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`import boto3` and the credential lookup take hundreds of ms; the loop must not pay it."""
+    """`import boto3` and the credential lookup take hundreds of ms; the loop must not pay it.
+
+    Asserted by thread identity, which is deterministic. A bound on loop stall time would also
+    count time the process spends descheduled, so it is deliberately not used.
+    """
     built_on: list[int] = []
 
     def slow_make_client(region_name: str | None = None) -> StubConverseClient:
@@ -247,17 +252,52 @@ async def test_the_lazy_client_is_built_on_a_worker_thread_not_the_event_loop(
         return StubConverseClient([ModelResponse.of("ok")])
 
     monkeypatch.setattr(bedrock_module, "make_client", slow_make_client)
-    stalls: list[float] = []
-
-    async def ticker() -> None:
-        last = time.monotonic()
-        for _ in range(20):
-            await asyncio.sleep(0.01)
-            now = time.monotonic()
-            stalls.append(now - last)
-            last = now
-
-    await asyncio.gather(BedrockProvider(MODEL).converse(request()), ticker())
+    await BedrockProvider(MODEL).converse(request())
     assert built_on
     assert threading.get_ident() not in built_on
-    assert max(stalls) < 0.15, f"the event loop stalled for {max(stalls):.3f}s"
+
+
+# -- the real client's configuration (built offline: no request is made) -----------------------
+
+
+@pytest.fixture
+def fake_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    monkeypatch.delenv("AWS_MAX_ATTEMPTS", raising=False)
+    monkeypatch.delenv("AWS_RETRY_MODE", raising=False)
+
+
+def test_the_real_client_makes_exactly_one_attempt(
+    monkeypatch: pytest.MonkeyPatch, fake_credentials: None
+) -> None:
+    """A botocore retry runs inside the worker thread, past the limiter, so there must be none.
+
+    Asserts the *resolved* configuration: botocore rewrites what it is given, and `max_attempts`
+    means retries after the first request, so `max_attempts=1` resolves to two attempts.
+    """
+    # Even an environment that asks for more must not win over the explicit setting.
+    monkeypatch.setenv("AWS_MAX_ATTEMPTS", "5")
+    client: Any = REAL_MAKE_CLIENT("us-east-1")
+    retries = client.meta.config.retries
+    assert retries["total_max_attempts"] == 1
+    assert "max_attempts" not in retries
+
+
+def test_the_trap_this_guards_against_is_real(fake_credentials: None) -> None:
+    """Control: `max_attempts=1`, as first written, resolves to two attempts."""
+    import boto3
+    from botocore.config import Config
+
+    client: Any = boto3.client(
+        "bedrock-runtime",
+        region_name="us-east-1",
+        config=Config(retries={"max_attempts": 1, "mode": "standard"}),
+    )
+    assert client.meta.config.retries["total_max_attempts"] == 2
+
+
+def test_the_real_client_keeps_its_timeouts(fake_credentials: None) -> None:
+    client: Any = REAL_MAKE_CLIENT("us-east-1")
+    assert client.meta.config.connect_timeout == bedrock_module.DEFAULT_CONNECT_TIMEOUT_SECONDS
+    assert client.meta.config.read_timeout == bedrock_module.DEFAULT_READ_TIMEOUT_SECONDS

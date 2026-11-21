@@ -50,10 +50,14 @@ def make_client(region_name: str | None = None) -> ConverseClient:
     import boto3
     from botocore.config import Config
 
+    # `total_max_attempts`, not `max_attempts`: in botocore's client config `max_attempts` counts
+    # retries *after* the first request, so `max_attempts=1` sends two. A retry happens inside the
+    # worker thread, past `RateLimitedProvider`'s admission and spacing, so it would double the
+    # real request rate exactly when Bedrock is throttling.
     config = Config(
         connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS,
         read_timeout=DEFAULT_READ_TIMEOUT_SECONDS,
-        retries={"max_attempts": 1, "mode": "standard"},
+        retries={"total_max_attempts": 1, "mode": "standard"},
     )
     client: ConverseClient = boto3.client("bedrock-runtime", region_name=region_name, config=config)
     return client

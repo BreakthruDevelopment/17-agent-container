@@ -125,6 +125,9 @@ def test_bad_settings_are_refused() -> None:
 # -- review findings on PR #10 ------------------------------------------------------------------
 
 
+INTERVAL = 0.03  # 30 ms
+
+
 class ThreadedProvider(ModelProvider):
     """Like `BedrockProvider`: the call is a worker thread that cancelling the await cannot stop."""
 
@@ -231,7 +234,7 @@ async def test_spacing_holds_when_the_event_loop_stalls_past_several_reservation
             starts.append(time.monotonic())
             return ModelResponse.of("ok")
 
-    limited = RateLimitedProvider(Stamp(), max_concurrent=5, min_interval_seconds=0.03)
+    limited = RateLimitedProvider(Stamp(), max_concurrent=5, min_interval_seconds=INTERVAL)
 
     async def stall() -> None:
         await asyncio.sleep(0.005)
@@ -241,4 +244,4 @@ async def test_spacing_holds_when_the_event_loop_stalls_past_several_reservation
     await asyncio.gather(*(limited.converse(req) for _ in range(3)), stall())
     gaps = [b - a for a, b in itertools.pairwise(sorted(starts))]
     assert len(gaps) == 2
-    assert all(gap >= 0.025 for gap in gaps), gaps  # 30 ms, less clock slack
+    assert all(gap >= INTERVAL for gap in gaps), gaps

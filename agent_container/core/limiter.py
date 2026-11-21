@@ -71,6 +71,14 @@ class RateLimitedProvider(ModelProvider):
             async with self._admit:
                 while (wait := self._last_start + self._interval - self._clock()) > 0:
                     await self._sleep(wait)
+                # INVARIANT, do not break: there is no suspension point (no `await`) between here
+                # and `await started.wait()` below. The task is created and its first step queued
+                # ahead of any cancellation that could arrive, so by the time this coroutine can be
+                # cancelled `_run` is already running and owns the permit, and its `finally`
+                # releases it. An `await` inserted in this window would let a cancellation land
+                # after `in_flight` was raised and before the task exists, leaking the permit and
+                # leaving `in_flight` too high for ever. This holds on the FIFO ready queue; it is
+                # structural, not a guarantee the event loop makes, so keep the window empty.
                 started = asyncio.Event()
                 self.in_flight += 1
                 self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
