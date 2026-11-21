@@ -83,7 +83,7 @@ def test_the_manifest_schema_is_model_prompt_tools_limits_permissions() -> None:
 
 
 def test_an_unknown_manifest_field_is_refused() -> None:
-    with pytest.raises(ManifestError, match="Extra inputs"):
+    with pytest.raises(ManifestError, match="is not a known field"):
         load_manifest(MANIFEST + "kind: factory\n")
 
 
@@ -454,3 +454,63 @@ def test_invalid_limits_do_not_echo_the_values() -> None:
     assert "99_777_333".replace("_", "") not in str(caught.value)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+# Every position a secret can occupy in a manifest. `loc` carries unknown KEYS and `msg` carries
+# whatever a validator interpolated, and `include_input=False` covers neither -- so round 3 of
+# this leak was in `str(ManifestError)` itself, reaching any caller's log with no traceback
+# render needed. Unlike `input_value`, `loc` is not truncated at all: a 20000-character key was
+# measured arriving verbatim.
+_MARKER = "MARKERsecretabc123"
+_LONG_KEY = "Z" * 20_000
+
+
+@pytest.mark.parametrize(
+    ("label", "document"),
+    [
+        ("unknown key", f"model: m\nsystem_prompt: p\n{_MARKER}: 1\n"),
+        ("unknown key, untruncated", f"model: m\nsystem_prompt: p\n? >-\n  {_LONG_KEY}\n: 1\n"),
+        ("bad tool name", f'model: m\nsystem_prompt: p\ntools: ["{_MARKER} bad!"]\n'),
+        ("duplicate tool name", f'model: m\nsystem_prompt: p\ntools: ["{_MARKER}", "{_MARKER}"]\n'),
+        ("unknown nested key", f"model: m\nsystem_prompt: p\nlimits: {{{_MARKER}: 2}}\n"),
+        ("missing field", f'system_prompt: "{_MARKER}"\n'),
+        ("wrong type", f'model: [1, 2]\nsystem_prompt: "{_MARKER}"\n'),
+    ],
+)
+def test_the_error_message_itself_does_not_echo_the_manifest(label: str, document: str) -> None:
+    with pytest.raises(ManifestError) as caught:
+        load_manifest(document)
+    message = str(caught.value)
+    assert _MARKER not in message, f"{label}: leaked into the message: {message!r}"
+    assert _LONG_KEY[:200] not in message, f"{label}: leaked an unknown key"
+    rendered = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert _MARKER not in rendered, f"{label}: leaked into the rendered traceback"
+    # Bounded: the pre-fix message for the long-key case measured 20050 characters.
+    assert len(message) < 500, f"{label}: message is {len(message)} characters"
+
+
+def test_our_own_validators_carry_no_values() -> None:
+    """A validator that interpolates the value puts it straight into `msg`, which ours did.
+
+    `_describe_error` no longer passes `msg` through, so a careless validator added later
+    cannot reopen the hole -- but the validators are kept value-free as well, because their
+    `ValueError` is visible to anyone who validates a `Manifest` directly.
+    """
+    import re
+
+    source = Path("agent_container/core/builder.py").read_text()
+    body = source.split("def load_manifest")[0]
+    for raised in re.findall(r"raise ValueError\((.+?)\)\n", body):
+        assert not raised.lstrip().startswith("f"), f"validator interpolates a value: {raised}"
+
+
+def test_unregistered_tool_names_are_not_echoed() -> None:
+    """The missing names are document content by definition; the registry's are the caller's."""
+    with pytest.raises(ManifestError) as caught:
+        AgentBuilder().with_manifest(
+            'model: m\nsystem_prompt: p\ntools: ["nosuchtool"]\n'
+        ).with_provider(scripted()).with_tools([EchoTool()]).build()
+    assert "nosuchtool" not in str(caught.value), str(caught.value)
+    assert "registered tools" in str(caught.value), str(caught.value)

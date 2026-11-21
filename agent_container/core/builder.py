@@ -15,6 +15,7 @@ from typing import Self, TextIO
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic_core import ErrorDetails
 
 from agent_container.core.budget import Budget
 from agent_container.core.errors import AgentContainerError
@@ -84,11 +85,71 @@ class Manifest(BaseModel):
         seen: set[str] = set()
         for name in names:
             if not TOOL_NAME_PATTERN.match(name):
-                raise ValueError(f"invalid tool name {name!r}")
+                # No value in the message: it reaches the caller through `msg`. See
+                # `_describe_error`.
+                raise ValueError("is not a valid tool name")
             if name in seen:
-                raise ValueError(f"duplicate tool name {name!r}")
+                raise ValueError("is a duplicate tool name")
             seen.add(name)
         return names
+
+
+# Every field name the manifest may legitimately contain. A `loc` segment outside this set came
+# from the DOCUMENT, not from the schema -- with `extra="forbid"` an unknown key becomes a loc
+# segment -- so it is redacted. Unlike pydantic's `input_value`, `loc` is not truncated at all:
+# a 20000-character key was measured reaching the message verbatim.
+_KNOWN_FIELDS: frozenset[str] = frozenset(Manifest.model_fields) | frozenset(Limits.model_fields)
+
+# Fixed text per pydantic error code, so the message never depends on `msg`. `msg` is partly
+# input-derived -- a `field_validator` that interpolates the value puts it straight in, which is
+# what ours did -- and a future validator must not be able to reopen that hole by being careless.
+_ERROR_TEXT: dict[str, str] = {
+    "missing": "is required",
+    "extra_forbidden": "is not a known field",
+    "string_type": "must be a string",
+    "list_type": "must be a list",
+    "dict_type": "must be a mapping",
+    "int_type": "must be an integer",
+    "int_parsing": "must be an integer",
+    "float_type": "must be a number",
+    "float_parsing": "must be a number",
+    "bool_type": "must be a boolean",
+    "greater_than_equal": "is below the permitted minimum",
+    "greater_than": "is below the permitted minimum",
+    "less_than_equal": "is above the permitted maximum",
+    "less_than": "is above the permitted maximum",
+    "too_long": "is too long",
+    "too_short": "is too short",
+}
+
+
+def _describe_error(error: ErrorDetails) -> str:
+    """Render one pydantic error with nothing in it that came from the document.
+
+    Both halves of the obvious one-liner are input-derived and `include_input=False` covers
+    neither: `loc` carries unknown KEYS, and `msg` carries whatever a validator interpolated.
+    """
+    where = ".".join(
+        str(part) if isinstance(part, int) else (part if part in _KNOWN_FIELDS else "<redacted>")
+        for part in error["loc"]
+    )
+    code = error["type"]
+    if code == "value_error":
+        # One of our own validators. Their messages are value-free by construction (see
+        # `tool_names_are_identifiers`), but we still do not pass `msg` through: strip
+        # pydantic's "Value error, " prefix only if what is left is in the known set.
+        detail = error["msg"].removeprefix("Value error, ")
+        what = detail if detail in _VALUE_ERRORS else "is not valid"
+    else:
+        what = _ERROR_TEXT.get(code, code)
+    return f"{where or 'manifest'}: {what}"
+
+
+# The exact, value-free messages our own validators raise. Anything else is reported generically,
+# so a validator added later cannot leak by interpolating a value into its ValueError.
+_VALUE_ERRORS: frozenset[str] = frozenset(
+    {"must not be blank", "is not a valid tool name", "is a duplicate tool name"}
+)
 
 
 def load_manifest(text: str) -> Manifest:
@@ -159,8 +220,7 @@ def manifest_from_mapping(data: Mapping[str, object]) -> Manifest:
         # extracted above -- `str(exc)` still renders `input_value=<the manifest>`. Raising in
         # here would set `__context__` to the same object even with `from None`.
         invalid = "; ".join(
-            f"{'.'.join(str(p) for p in e['loc']) or 'manifest'}: {e['msg']}"
-            for e in exc.errors(include_url=False, include_input=False)
+            _describe_error(e) for e in exc.errors(include_url=False, include_input=False)
         )
     raise ManifestError(f"invalid manifest: {invalid}")
 
@@ -354,8 +414,13 @@ class AgentBuilder:
             else:
                 selected.append(tool)
         if missing:
+            # The missing names came from the manifest and are by definition not in the
+            # registry, so they are document content. The REGISTERED names are the caller's
+            # own and safe to list -- and more useful for fixing the manifest anyway.
+            available = ", ".join(sorted(self._tools)) or "none"
             raise ManifestError(
-                "manifest names tools that were not registered: " + ", ".join(missing)
+                f"manifest names {len(missing)} tool(s) that were not registered; "
+                f"registered tools: {available}"
             )
         return selected
 
