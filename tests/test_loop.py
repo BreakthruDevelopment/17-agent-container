@@ -33,9 +33,9 @@ from agent_container.core import (
     UnrecognizedStopReason,
     Usage,
 )
-from agent_container.core.loop import _TOOL_NAME
+from agent_container.core.loop import _SKELETON, _TOOL_NAME
 from agent_container.core.messages import TextBlock
-from tests.support import DeleteTool, EchoTool, scripted, tool_call, use_tool
+from tests.support import DeleteTool, EchoArgs, EchoTool, scripted, tool_call, use_tool
 
 NONCE = "testnonce0123456"
 
@@ -391,7 +391,10 @@ async def test_oversized_tool_output_is_cut() -> None:
 
 def test_run_is_final_and_the_skeleton_cannot_be_overridden() -> None:
     assert getattr(AgentLoop.run, "__final__", False)
-    for name in ("run", "_call_model", "_run_tool", "_finish", "_publish"):
+    # Iterate the real tuple, not a copy of it: a second list is why adding `_record` to the
+    # skeleton could have been forgotten here and the test still passed.
+    assert len(_SKELETON) >= 6
+    for name in _SKELETON:
         with pytest.raises(TypeError, match="skeleton"):
             type("Bad", (AgentLoop,), {name: lambda self: None})
 
@@ -686,3 +689,34 @@ async def test_every_tool_call_is_answered_even_when_the_clock_stops_the_batch()
         assert asked == answered, f"cutoff={cutoff}: asked {asked}, answered {answered}"
         for m in result.messages:
             assert m.content, f"cutoff={cutoff}: empty message in the transcript"
+
+
+async def test_after_tool_sees_calls_the_clock_skipped() -> None:
+    """Its contract is "before it is fenced and returned to the model", and a cut-off result is.
+
+    A subclass that redacts or annotates results would otherwise have this one path escape it.
+    """
+    seen: list[str] = []
+
+    class Watching(AgentLoop):
+        async def after_tool(
+            self, state: RunState, call: ToolUseBlock, result: ToolResult
+        ) -> ToolResult:
+            seen.append(call.id)
+            return result
+
+    now = [0.0]
+
+    def eat_the_clock(_: EchoArgs) -> ToolResult:
+        now[0] += 10.0
+        return ToolResult.ok("x")
+
+    calls = tuple(ToolUseBlock(f"c{i}", "echo", {"text": str(i)}) for i in range(3))
+    provider = scripted(
+        ModelResponse(content=calls, stop_reason="tool_use"), ModelResponse.of("done")
+    )
+    await Watching(provider, [EchoTool(eat_the_clock)], system_prompt="p").run(
+        "go", Budget(max_seconds=5, clock=functools.partial(_read, now))
+    )
+
+    assert seen == ["c0", "c1", "c2"], seen

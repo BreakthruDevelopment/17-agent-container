@@ -59,7 +59,12 @@ def _safe_name(name: str) -> str:
 _log = logging.getLogger("agent_container.loop")
 
 # Everything in the skeleton. `__init_subclass__` refuses a subclass that defines any of these.
-_SKELETON = ("run", "_call_model", "_run_tool", "_finish", "_publish")
+# Anything that fences tool output, sanitises a model-chosen name, records a call or publishes an
+# event belongs here: a subclass that could replace one of those could unfence the model's input.
+# `_record` was added on 2026-11-20 when block-building moved out of `_run_tool` into it -- the
+# extraction silently took guarded behaviour out of the guard, which is the hazard to watch for
+# whenever this loop is refactored.
+_SKELETON = ("run", "_call_model", "_run_tool", "_record", "_finish", "_publish")
 
 
 class EndReason(StrEnum):
@@ -319,7 +324,12 @@ class AgentLoop:
                             # unanswered ToolUseBlock makes the transcript unsendable, and 17.3
                             # owns making it resumable without being allowed to edit `core/`.
                             for skipped in response.tool_uses[len(blocks) :]:
-                                blocks.append(await self._record(run, skipped, _CUT_OFF))
+                                # Through `after_tool` like any other result: its contract is
+                                # "adjust a tool's result before it is fenced and returned to the
+                                # model", and a cut-off result is fenced and returned. A subclass
+                                # redacting or annotating results must not have this one escape.
+                                cut = await self.after_tool(run.state(), skipped, _CUT_OFF)
+                                blocks.append(await self._record(run, skipped, cut))
                             exceeded = BudgetExceeded(
                                 "wall_clock", run.budget.elapsed, run.budget.max_seconds
                             )
