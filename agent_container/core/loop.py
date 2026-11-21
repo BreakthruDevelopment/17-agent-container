@@ -219,7 +219,18 @@ class _LoopMeta(ABCMeta):
         mcls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], /, **kwargs: Any
     ) -> _LoopMeta:
         cls = super().__new__(mcls, name, bases, namespace, **kwargs)
-        base = next((b for b in cls.__mro__[1:] if b.__name__ == "AgentLoop"), None)
+        # Identity, with the name match only as the bootstrap fallback while `AgentLoop` is
+        # still being created and the module global does not exist yet. Matching on the name
+        # alone would let a consumer's own class called `AgentLoop` stand in as the base.
+        anchor = globals().get("AgentLoop")
+        base = next(
+            (
+                b
+                for b in cls.__mro__[1:]
+                if b is anchor or (anchor is None and b.__name__ == "AgentLoop")
+            ),
+            None,
+        )
         if base is None:  # AgentLoop itself
             return cls
         replaced = [
@@ -228,16 +239,18 @@ class _LoopMeta(ABCMeta):
             if getattr(cls, member, None) is not getattr(base, member, None)
         ]
         # The guard is part of the skeleton too, by whichever route it arrives.
-        # A class between `cls` and `AgentLoop` that defines `__init_subclass__` is refused too:
-        # it no longer disables this guard (a metaclass runs regardless), but it would silence
-        # `AgentLoop`'s own hook for every descendant, and the next reader would reasonably
-        # assume the hook still fires. Identity comparison does not work here -- the implicit
-        # classmethod binds per class, so `getattr` differs even when inherited unchanged --
-        # so this asks which classes actually define one.
+        # An AgentLoop-derived class that defines `__init_subclass__` is refused: it would
+        # silence `AgentLoop`'s own hook for every descendant. Restricted to `_LoopMeta`
+        # instances because ordinary bases legitimately define one -- `typing.Generic` does, and
+        # so does any cooperative mixin that consumes class keyword arguments. Refusing those
+        # was a false positive, and a guard that wrongly refuses costs apps 18-20 as much as one
+        # that wrongly allows. The metaclass runs whatever the MRO does, so nothing here is
+        # load-bearing for the guard itself. Identity comparison does not work -- the implicit
+        # classmethod binds per class -- so this asks which classes actually define one.
         defines_hook = [
             ancestor.__name__
             for ancestor in cls.__mro__[: cls.__mro__.index(base)]
-            if "__init_subclass__" in vars(ancestor)
+            if "__init_subclass__" in vars(ancestor) and isinstance(ancestor, _LoopMeta)
         ]
         if defines_hook:
             replaced.append(f"__init_subclass__ (on {', '.join(defines_hook)})")
@@ -255,15 +268,13 @@ class AgentLoop(metaclass=_LoopMeta):
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Consume PEP 487 class keyword arguments. The guard itself lives in `_LoopMeta`.
 
-        `class MyAgent(AgentLoop, tag="x")` otherwise fails on `object`'s default, which takes
-        none -- and the usual way round that, a base class before `AgentLoop` that consumes
-        them, is the ordering `_LoopMeta` refuses. So the arguments are consumed here rather
-        than forwarded; `AgentLoop` itself defines none and ignores whatever it is given.
-        Defining this hook on a subclass is still refused by the metaclass, so it cannot be
-        used to silence the guard.
+        They are forwarded, not swallowed: a cooperative mixin that consumes `tag` gets it from
+        either side of `AgentLoop` in the bases, and a name nothing consumes still reaches
+        `object.__init_subclass__` and is rejected -- so `tagg="x"` is a `TypeError` rather than
+        a silent no-op. `AgentLoop` itself defines no class keyword arguments. Defining this
+        hook on a subclass is refused by the metaclass, so it cannot silence the guard.
         """
-        del kwargs  # consumed, not forwarded: `object.__init_subclass__` accepts none
-        super().__init_subclass__()
+        super().__init_subclass__(**kwargs)
 
     def __init__(
         self,

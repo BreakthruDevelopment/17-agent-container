@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 from dataclasses import FrozenInstanceError
+from typing import Generic, TypeVar
 
 import pytest
 
@@ -34,6 +35,7 @@ from agent_container.core import (
     Usage,
 )
 from agent_container.core.loop import _SKELETON, _TOOL_NAME
+from agent_container.core.loop import AgentLoop as _RealLoop
 from agent_container.core.messages import TextBlock
 from tests.support import DeleteTool, EchoArgs, EchoTool, scripted, tool_call, use_tool
 
@@ -813,3 +815,68 @@ async def test_after_tool_sees_calls_the_clock_skipped() -> None:
     )
 
     assert seen == ["c0", "c1", "c2"], seen
+
+
+# -- the guard must not refuse what apps 18-20 will actually write ---------------------------------
+
+
+def test_a_generic_subclass_is_allowed() -> None:
+    """`typing.Generic` defines its own `__init_subclass__`, and sorts before `AgentLoop`.
+
+    Refusing it was a false positive found in round 12: a guard that wrongly refuses costs the
+    consuming apps as much as one that wrongly allows.
+    """
+    T = TypeVar("T")
+
+    class GenericFirst(Generic[T], AgentLoop):
+        pass
+
+    assert GenericFirst is not None
+
+
+def test_a_cooperative_mixin_consuming_class_kwargs_is_allowed() -> None:
+    """The registry pattern: a mixin that takes a class keyword argument and calls `super()`.
+
+    This is the shape the metaclass docstring calls "needs no intent to circumvent", so it must
+    work from either side of `AgentLoop` in the bases.
+    """
+    seen: list[str] = []
+
+    class Registry:
+        def __init_subclass__(cls, tag: str | None = None, **kw: object) -> None:
+            super().__init_subclass__(**kw)
+            if tag:
+                seen.append(tag)
+
+    class Before(Registry, AgentLoop, tag="before"):
+        pass
+
+    class After(AgentLoop, Registry, tag="after"):
+        pass
+
+    assert seen == ["before", "after"]
+    assert Before is not None and After is not None
+
+
+def test_a_class_keyword_nothing_consumes_is_rejected() -> None:
+    """Forwarded, not swallowed, so a typo is a TypeError rather than a silent no-op."""
+    with pytest.raises(TypeError):
+
+        class Typo(AgentLoop, tagg="x"):
+            pass
+
+
+def test_a_decoy_class_named_agentloop_cannot_stand_in_as_the_base() -> None:
+    """The metaclass finds its base by identity, not by name."""
+
+    # A decoy named `AgentLoop` that carries the real skeleton apart from `_record`, which it
+    # replaces. A guard matching its base by name anchors on the decoy, compares the subclass
+    # against it, finds nothing changed, and lets the replacement through -- the subclass itself
+    # declares nothing. Identity anchoring on the real class catches it.
+    members = {name: getattr(_RealLoop, name) for name in _SKELETON}
+    members["_record"] = lambda self, *a: None
+    decoy = type("AgentLoop", (), members)
+
+    # Built with `type()` so mypy does not analyse the deliberate shadowing.
+    with pytest.raises(TypeError, match="skeleton"):
+        type("Sneaky", (decoy, _RealLoop), {})
