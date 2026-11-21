@@ -29,7 +29,7 @@ from agent_container.core import (
     UngatedWriteError,
     load_manifest,
 )
-from agent_container.core.builder import _INDEXED_FIELDS
+from agent_container.core.builder import _INDEXED_FIELDS, Limits, Manifest
 from tests.support import (
     DeleteTool,
     EchoTool,
@@ -489,7 +489,11 @@ def test_the_error_message_itself_does_not_echo_the_manifest(label: str, documen
         traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
     )
     assert _MARKER not in rendered, f"{label}: leaked into the rendered traceback"
-    # Bounded: the pre-fix message for the long-key case measured 20050 characters.
+    # Bounded PER ERROR here; the count is bounded separately, by `_MAX_REPORTED_PROBLEMS`.
+    # The original comment just said "Bounded", which was true only because every document in
+    # this corpus produces one or two errors -- a 5000-key manifest rendered 170016
+    # characters and this assertion never saw it. See
+    # `test_a_manifest_with_many_problems_has_a_bounded_message`.
     assert len(message) < 500, f"{label}: message is {len(message)} characters"
 
 
@@ -506,21 +510,35 @@ def test_our_own_validators_carry_no_values() -> None:
     `str(value)`, implicit concatenation and a trailing comment all walked past it.
     """
     tree = ast.parse(Path("agent_container/core/builder.py").read_text())
+    # Functions wrapped in `AfterValidator(...)` validate too, and are not decorated, so the
+    # decorator search alone would walk straight past `_valid_tool_name`.
+    wrapped = {
+        argument.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "AfterValidator"
+        for argument in node.args
+        if isinstance(argument, ast.Name)
+    }
     validators = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef)
-        and any(
-            (isinstance(d, ast.Call) and getattr(d.func, "id", None) == "field_validator")
-            or getattr(d, "id", None) == "field_validator"
-            for d in node.decorator_list
+        and (
+            node.name in wrapped
+            or any(
+                (isinstance(d, ast.Call) and getattr(d.func, "id", None) == "field_validator")
+                or getattr(d, "id", None) == "field_validator"
+                for d in node.decorator_list
+            )
         )
     ]
     # Names, not a count: this also fails if a validator is renamed or dropped, rather than
     # quietly checking fewer functions than it thinks.
-    assert {v.name for v in validators} == {"not_blank", "tool_names_are_identifiers"}, (
-        f"validators changed: {sorted(v.name for v in validators)}"
-    )
+    assert {v.name for v in validators} == {
+        "not_blank",
+        "tool_names_are_identifiers",
+        "_valid_tool_name",
+    }, f"validators changed: {sorted(v.name for v in validators)}"
     for validator in validators:
         for node in ast.walk(validator):
             if not isinstance(node, ast.Raise) or node.exc is None:
@@ -592,3 +610,66 @@ def test_unregistered_tool_names_are_not_echoed() -> None:
         ).with_provider(scripted()).with_tools([EchoTool()]).build()
     assert "nosuchtool" not in str(caught.value), str(caught.value)
     assert "registered tools" in str(caught.value), str(caught.value)
+
+
+def test_a_manifest_with_many_problems_has_a_bounded_message() -> None:
+    """Each rendered error is bounded; their number was not.
+
+    5000 unknown keys produced a 170016-character `ManifestError`. No value escaped -- every
+    one rendered as `<redacted>` -- but a diagnostic that size is its own problem, and it is
+    the un-addressed half of the explicit-key finding. The single-error corpus above asserted
+    `len(message) < 500` and never saw this, which is the overstated-test shape that hid three
+    earlier rounds of this same leak.
+    """
+    document = "model: m\nsystem_prompt: p\n" + "".join(f"k{i}: 1\n" for i in range(5_000))
+    with pytest.raises(ManifestError) as caught:
+        load_manifest(document)
+    message = str(caught.value)
+    assert len(message) < 500, f"message is {len(message)} characters"
+    assert "and 4995 more" in message, message  # 5000 errors, 5 shown
+
+
+def test_a_bad_tool_name_reports_its_index() -> None:
+    """A `field_validator` on the list cannot say which entry was bad.
+
+    `loc` for a list-level validator is just `("tools",)`, so this reported no position at all
+    -- on the path users hit most, and the very diagnostic `_INDEXED_FIELDS` exists to carry.
+    `ToolName` validates each item instead.
+    """
+    with pytest.raises(ManifestError) as caught:
+        load_manifest('model: m\nsystem_prompt: p\ntools: [ok, "BAD!", ok2]\n')
+    assert "tools.1" in str(caught.value), str(caught.value)
+    assert "BAD" not in str(caught.value), str(caught.value)
+
+
+def test_an_empty_string_and_a_blank_string_read_the_same() -> None:
+    """`model: ""` hits pydantic's `min_length`; `model: "   "` hits our validator."""
+    messages = []
+    for document in ['model: ""\nsystem_prompt: p\n', 'model: "   "\nsystem_prompt: p\n']:
+        with pytest.raises(ManifestError) as caught:
+            load_manifest(document)
+        messages.append(str(caught.value))
+    assert messages[0] == messages[1], messages
+
+
+def test_no_field_uses_a_collection_the_derivation_cannot_see() -> None:
+    """`_list_valued_fields` matches `get_origin(...) is list` and nothing else.
+
+    `Sequence[str]`, `tuple[str, ...]`, `set[str]`, `frozenset[str]` and a PEP-695 `type`
+    alias all still get integer indices from pydantic, so they would be redacted rather than
+    reported: a worse message, not a leak. The equality assert above is loud if `permissions`
+    CHANGES or a `list` field is added, but silent if someone adds a `Sequence` field -- so
+    this fails instead, naming what to teach the derivation.
+    """
+    from collections.abc import Sequence as AbcSequence
+    from typing import get_args, get_origin
+
+    opaque = (AbcSequence, tuple, set, frozenset)
+    for model in (Manifest, Limits):
+        for name, field in model.model_fields.items():
+            for candidate in (field.annotation, *get_args(field.annotation)):
+                origin = get_origin(candidate)
+                assert origin not in opaque, (
+                    f"{model.__name__}.{name} is a {origin}, which _list_valued_fields "
+                    f"cannot see; teach it that spelling or its indices will be redacted"
+                )

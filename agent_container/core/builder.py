@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Self, TextIO, get_args, get_origin
+from typing import Annotated, Self, TextIO, get_args, get_origin
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_core import ErrorDetails
 
 from agent_container.core.budget import Budget
@@ -57,6 +57,17 @@ class Limits(BaseModel):
     max_seconds: float = Field(default=_DEFAULT_MAX_SECONDS, ge=0.0)
 
 
+def _valid_tool_name(name: str) -> str:
+    if not TOOL_NAME_PATTERN.match(name):
+        # Value-free for the reason in `_describe_error`; the index comes from `loc`.
+        raise ValueError("is not a valid tool name")
+    return name
+
+
+# Per item rather than on the list, so `loc` carries the offending index.
+ToolName = Annotated[str, AfterValidator(_valid_tool_name)]
+
+
 class Manifest(BaseModel):
     """The YAML schema: model, system prompt, tool names, limits, permissions."""
 
@@ -66,7 +77,7 @@ class Manifest(BaseModel):
     system_prompt: str = Field(min_length=1)
     # None: the key was omitted, so every registered tool is included. An explicit
     # empty list is an allowlist of nothing.
-    tools: list[str] | None = None
+    tools: list[ToolName] | None = None
     limits: Limits = Field(default_factory=Limits)
     permissions: list[str] = Field(default_factory=list)
 
@@ -80,15 +91,20 @@ class Manifest(BaseModel):
     @field_validator("tools")
     @classmethod
     def tool_names_are_identifiers(cls, names: list[str] | None) -> list[str] | None:
+        """Only the duplicate check. The NAME check is per item, so its error carries an index.
+
+        A `field_validator` on the list cannot say which entry was bad -- pydantic's `loc` for
+        it is just `("tools",)` -- so `tools: [ok, "BAD!", ok2]` reported no position at all,
+        on the path users hit most. `ToolName` below validates each item, giving `tools.1`.
+        A duplicate genuinely is a property of the list, so it stays here.
+        """
         if names is None:
             return None
         seen: set[str] = set()
         for name in names:
-            if not TOOL_NAME_PATTERN.match(name):
+            if name in seen:
                 # No value in the message: it reaches the caller through `msg`. See
                 # `_describe_error`.
-                raise ValueError("is not a valid tool name")
-            if name in seen:
                 raise ValueError("is a duplicate tool name")
             seen.add(name)
         return names
@@ -120,7 +136,7 @@ _ERROR_TEXT: dict[str, str] = {
     "less_than": "is above the permitted maximum",
     "too_long": "is too long",
     "too_short": "is too short",
-    "string_too_short": "must not be empty",
+    "string_too_short": "must not be blank",
     "model_type": "must be a mapping",
     "int_from_float": "must be a whole number",
     "invalid_key": "is not a usable key",
@@ -155,6 +171,13 @@ def _list_valued_fields(*models: type[BaseModel]) -> frozenset[str]:
 # `0xDEADBEEF` (as 3735928559). Larger ints and all floats pydantic stringifies, so those were
 # already caught by the `_KNOWN_FIELDS` arm.
 _INDEXED_FIELDS: frozenset[str] = _list_valued_fields(Manifest, Limits)
+
+# Checking only the PARENT segment is sufficient because no field of this schema is both
+# list-valued and mapping-valued: `limits` is the only mapping, `tools` and `permissions` the
+# only lists. A mapping key under `tools` cannot reach `loc` at all -- pydantic rejects
+# `tools: {5: x}` as `list_type` before descending. A field typed `dict[str, X] | list[str]`
+# would break that invariant, and no current test would notice.
+_MAX_REPORTED_PROBLEMS = 5
 
 
 def _describe_error(error: ErrorDetails) -> str:
@@ -258,9 +281,16 @@ def manifest_from_mapping(data: Mapping[str, object]) -> Manifest:
         # ValidationError as `__cause__`, and `include_input=False` only sanitizes the string
         # extracted above -- `str(exc)` still renders `input_value=<the manifest>`. Raising in
         # here would set `__context__` to the same object even with `from None`.
-        invalid = "; ".join(
-            _describe_error(e) for e in exc.errors(include_url=False, include_input=False)
-        )
+        # Each rendered error is bounded (a known field name or `<redacted>`, plus fixed
+        # text), but their NUMBER is not: 5000 unknown keys rendered a 170016-character
+        # message. No value escaped, but a diagnostic that size is its own problem, and the
+        # test asserting `len(message) < 500` was true only for single-error documents --
+        # the same overstated-test shape that hid three earlier rounds of this leak.
+        problems = exc.errors(include_url=False, include_input=False)
+        shown = [_describe_error(e) for e in problems[:_MAX_REPORTED_PROBLEMS]]
+        if len(problems) > _MAX_REPORTED_PROBLEMS:
+            shown.append(f"and {len(problems) - _MAX_REPORTED_PROBLEMS} more")
+        invalid = "; ".join(shown)
     raise ManifestError(f"invalid manifest: {invalid}")
 
 
