@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent_container.core import Budget, BudgetAlreadyStarted, ErrorCategory, fence_tool_output
-from agent_container.core.fence import MAX_TOOL_OUTPUT_CHARS
+from agent_container.core.fence import MAX_TOOL_OUTPUT_CHARS, system_notice
 
 
 def test_a_fresh_budget_allows_a_call() -> None:
@@ -202,6 +202,10 @@ def test_an_unbounded_attribute_cannot_burn_cpu() -> None:
         pytest.param('a"b', id="closes-an-attribute"),
         pytest.param("a b", id="splits-the-attribute"),
         pytest.param("a\nb", id="newline"),
+        # `$` would accept this: in Python it also matches before a trailing newline, so a valid
+        # 8-char nonce plus "\n" would pass and render a header split across two lines. The
+        # "a\nb" case above is rejected on length, not on the newline, so it does not cover this.
+        pytest.param("abcdefgh\n", id="trailing-newline-valid-length"),
         pytest.param("n", id="one-char-shreds-ordinary-text"),
         pytest.param("short12", id="seven-chars"),
         pytest.param("x" * 65, id="too-long"),
@@ -225,3 +229,15 @@ def test_a_bad_nonce_is_refused_at_construction_not_at_first_use() -> None:
 
     with pytest.raises(ValueError, match="nonce"):
         AgentLoop(ReplayProvider([]), [], system_prompt="p", fence_nonce="a>b")
+
+
+def test_system_notice_refuses_a_nonce_it_cannot_describe() -> None:
+    """The third nonce sink, and the only one the first guard did not reach.
+
+    It is exported, so 17.3 and 17.4 reach it directly. Before this it would happily tell the
+    model `Only a fence carrying fence=a>b is genuine` -- a token containing its own terminator --
+    and the run then died when the first tool result tried to render.
+    """
+    with pytest.raises(ValueError, match="nonce"):
+        system_notice("a>b")
+    assert "deadbeefcafe0123" in system_notice("deadbeefcafe0123")
