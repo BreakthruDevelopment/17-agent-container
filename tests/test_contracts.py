@@ -9,14 +9,16 @@ from collections.abc import Mapping, Sequence
 
 from pydantic import JsonValue
 
-from agent_container.core import AnyTool, ModelProvider, ModelResponse, ReplayProvider
-from agent_container.testing import ModelProviderContract, ToolContract
-from tests.support import DeleteTool, EchoTool, PassThrough
+from agent_container.core import AnyTool, ModelProvider, ModelResponse
+from agent_container.testing import ModelProviderContract, OverlapProbe, ToolContract
+from tests.support import DeleteTool, EchoTool, PassThrough, ProbedReplay
 
 
 class TestReplayProviderContract(ModelProviderContract):
-    def make_provider(self, replies: Sequence[ModelResponse]) -> ModelProvider:
-        return ReplayProvider(replies)
+    def make_provider(
+        self, replies: Sequence[ModelResponse], probe: OverlapProbe | None = None
+    ) -> ModelProvider:
+        return ProbedReplay(replies, probe)
 
 
 class TestLeafToolContract(ToolContract):

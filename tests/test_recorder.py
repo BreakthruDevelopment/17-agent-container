@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,8 @@ from agent_container.core import (
     ToolUseBlock,
     Usage,
 )
-from tests.support import EchoTool, StubConverseClient, tool_call
+from agent_container.testing import ModelProviderContract, OverlapProbe
+from tests.support import EchoTool, ProbedReplay, StubConverseClient, tool_call
 
 NONCE = "testnonce0123456"
 
@@ -39,6 +41,13 @@ def stored(recorder: RecordingProvider) -> list[dict[str, Any]]:
     data: Any = recorder.to_dict()
     replies: list[dict[str, Any]] = data["replies"]
     return replies
+
+
+class TestRecordingProviderContract(ModelProviderContract):
+    def make_provider(
+        self, replies: Sequence[ModelResponse], probe: OverlapProbe | None = None
+    ) -> ModelProvider:
+        return RecordingProvider(ProbedReplay(replies, probe))
 
 
 SCRIPT = [

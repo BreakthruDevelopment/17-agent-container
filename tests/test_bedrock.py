@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -23,7 +26,7 @@ from agent_container.core import (
 )
 from agent_container.core import bedrock as bedrock_module
 from agent_container.core.messages import TextBlock
-from agent_container.testing import ModelProviderContract
+from agent_container.testing import ModelProviderContract, OverlapProbe
 from tests.support import StubConverseClient, to_wire
 
 MODEL = "anthropic.test-model-v1:0"
@@ -40,8 +43,10 @@ def no_real_client(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestBedrockProviderContract(ModelProviderContract):
-    def make_provider(self, replies: Sequence[ModelResponse]) -> ModelProvider:
-        return BedrockProvider(MODEL, client=StubConverseClient(replies))
+    def make_provider(
+        self, replies: Sequence[ModelResponse], probe: OverlapProbe | None = None
+    ) -> ModelProvider:
+        return BedrockProvider(MODEL, client=StubConverseClient(replies, probe=probe))
 
 
 def request(**overrides: Any) -> ModelRequest:
@@ -228,3 +233,31 @@ async def test_a_client_error_propagates_untouched() -> None:
 
     with pytest.raises(Throttled):
         await BedrockProvider(MODEL, client=Failing()).converse(request())
+
+
+async def test_the_lazy_client_is_built_on_a_worker_thread_not_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`import boto3` and the credential lookup take hundreds of ms; the loop must not pay it."""
+    built_on: list[int] = []
+
+    def slow_make_client(region_name: str | None = None) -> StubConverseClient:
+        built_on.append(threading.get_ident())
+        time.sleep(0.3)
+        return StubConverseClient([ModelResponse.of("ok")])
+
+    monkeypatch.setattr(bedrock_module, "make_client", slow_make_client)
+    stalls: list[float] = []
+
+    async def ticker() -> None:
+        last = time.monotonic()
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            now = time.monotonic()
+            stalls.append(now - last)
+            last = now
+
+    await asyncio.gather(BedrockProvider(MODEL).converse(request()), ticker())
+    assert built_on
+    assert threading.get_ident() not in built_on
+    assert max(stalls) < 0.15, f"the event loop stalled for {max(stalls):.3f}s"

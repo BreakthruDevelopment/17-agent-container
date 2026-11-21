@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from agent_container.core import (
     AnyTool,
     Effect,
+    ModelRequest,
     ModelResponse,
     ReplayProvider,
     TextBlock,
@@ -21,6 +22,20 @@ from agent_container.core import (
     ToolUseBlock,
     Usage,
 )
+from agent_container.testing import OverlapProbe
+
+
+class ProbedReplay(ReplayProvider):
+    """A `ReplayProvider` that honours an `OverlapProbe`, for the provider contract."""
+
+    def __init__(self, replies: Sequence[ModelResponse], probe: OverlapProbe | None = None) -> None:
+        super().__init__(replies)
+        self._probe = probe
+
+    async def converse(self, request: ModelRequest) -> ModelResponse:
+        if self._probe is not None:
+            await self._probe.wait_async()
+        return await super().converse(request)
 
 
 class EchoArgs(BaseModel):
@@ -185,15 +200,23 @@ def to_wire(reply: ModelResponse) -> dict[str, Any]:
         "usage": {
             "inputTokens": reply.usage.input_tokens,
             "outputTokens": reply.usage.output_tokens,
+            "totalTokens": reply.usage.total,  # required by the schema
         },
+        "metrics": {"latencyMs": 1},  # required by the schema
     }
 
 
 def check_transcript(messages: Sequence[Mapping[str, Any]]) -> None:
-    """The rules Bedrock enforces that this suite cares about; raises `ValueError` on a break.
+    """Rules a resumed transcript must satisfy; raises `ValueError` on a break.
 
-    Roles alternate, starting with the user. Every `toolUse` is answered by a `toolResult` with the
-    same id in the very next message, and a `toolResult` answers a call that was actually made.
+    ASSUMPTIONS, not the API contract. Neither rule is in botocore's Converse schema (see
+    `tests/test_converse_schema.py` for what is): both are runtime rules that Bedrock applies per
+    model family. They are encoded here because the Anthropic models this track targets enforce
+    them, and a transcript that breaks them is what app 19's resumption must not send.
+
+    * roles alternate, starting with the user;
+    * every `toolUse` is answered by a `toolResult` with the same id in the very next message, and
+      a `toolResult` answers a call that was actually made.
     """
     pending: set[str] = set()
     for i, message in enumerate(messages):
@@ -214,13 +237,22 @@ class StubConverseClient:
     No network, no boto3. With `strict=True` it also refuses a transcript Bedrock would refuse.
     """
 
-    def __init__(self, replies: Sequence[ModelResponse] = (), *, strict: bool = False) -> None:
+    def __init__(
+        self,
+        replies: Sequence[ModelResponse] = (),
+        *,
+        strict: bool = False,
+        probe: OverlapProbe | None = None,
+    ) -> None:
+        self._probe = probe
         self._wire = [to_wire(r) for r in replies]
         self._lock = threading.Lock()  # `converse` runs on worker threads
         self._strict = strict
         self.requests: list[dict[str, Any]] = []
 
     def converse(self, **kwargs: Any) -> Mapping[str, Any]:
+        if self._probe is not None:
+            self._probe.wait_blocking()  # on the provider's worker thread
         if self._strict:
             check_transcript(kwargs["messages"])
         with self._lock:

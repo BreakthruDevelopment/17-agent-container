@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 
@@ -53,12 +54,59 @@ def _request(text: str = "hello") -> ModelRequest:
     return ModelRequest(system="You are a test.", messages=(Message.user_text(text),))
 
 
+class OverlapProbe:
+    """Proves calls overlap. Each call waits at a barrier until `parties` calls have all arrived.
+
+    A provider that serialises its calls can never get a second call to the barrier while the first
+    is waiting, so it times out and the test fails; "every call got a reply" cannot tell the two
+    apart. The barrier is deterministic: no sleeps, no timing windows.
+    """
+
+    TIMEOUT_SECONDS = 5.0
+
+    def __init__(self, parties: int) -> None:
+        self.parties = parties
+        self.arrived = 0
+        self._lock = threading.Lock()
+        self._thread_barrier = threading.Barrier(parties, timeout=self.TIMEOUT_SECONDS)
+        self._async_barrier = asyncio.Barrier(parties)
+
+    def _arrive(self) -> None:
+        with self._lock:
+            self.arrived += 1
+
+    async def wait_async(self) -> None:
+        """For a provider whose call is a coroutine: await this inside the call."""
+        self._arrive()
+        try:
+            async with asyncio.timeout(self.TIMEOUT_SECONDS):
+                await self._async_barrier.wait()
+        except TimeoutError:
+            raise AssertionError("calls did not overlap: a call waited alone") from None
+
+    def wait_blocking(self) -> None:
+        """For a provider whose call runs on a worker thread: call this inside that thread."""
+        self._arrive()
+        try:
+            self._thread_barrier.wait()
+        except threading.BrokenBarrierError:
+            raise AssertionError("calls did not overlap: a call waited alone") from None
+
+
 class ModelProviderContract(ABC):
     """Subclass, implement `make_provider`, and every test below runs against your provider."""
 
     @abstractmethod
-    def make_provider(self, replies: Sequence[ModelResponse]) -> ModelProvider:
-        """A provider that answers successive calls with exactly these replies, in order."""
+    def make_provider(
+        self, replies: Sequence[ModelResponse], probe: OverlapProbe | None = None
+    ) -> ModelProvider:
+        """A provider that answers successive calls with exactly these replies, in order.
+
+        When `probe` is given, the provider must call `probe.wait_async()` (or, if the call runs on
+        a worker thread, `probe.wait_blocking()` from that thread) once per call, at the point where
+        the underlying model call is in flight. A decorator passes the probe to what it wraps and
+        must not hold anything that would stop three calls being in flight at once.
+        """
 
     def test_converse_is_async(self) -> None:
         provider = self.make_provider([ModelResponse.of("hi")])
@@ -121,6 +169,23 @@ class ModelProviderContract(ABC):
         _require(
             sorted(r.text for r in got) == sorted(r.text for r in replies),
             "concurrent calls did not each receive one reply",
+        )
+
+    def test_concurrent_calls_are_in_flight_together(self) -> None:
+        """Answering everyone is not concurrency: a provider that queues calls does that too."""
+        replies = [ModelResponse.of(f"reply {i}") for i in range(3)]
+        probe = OverlapProbe(len(replies))
+        provider = self.make_provider(replies, probe)
+
+        async def fan_out() -> list[ModelResponse]:
+            return list(await asyncio.gather(*(provider.converse(_request()) for _ in replies)))
+
+        got = asyncio.run(fan_out())
+        _require(len(got) == len(replies), "a concurrent call got no reply")
+        _require(
+            probe.arrived == len(replies),
+            f"{probe.arrived} of {len(replies)} calls reached the model call; the probe was "
+            "not honoured by `make_provider`",
         )
 
 

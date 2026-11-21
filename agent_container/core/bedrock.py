@@ -74,7 +74,8 @@ def _json(value: JsonValue) -> JsonValue:
 def _block(block: ContentBlock) -> dict[str, Any] | None:
     match block:
         case TextBlock(text):
-            # Converse rejects a blank text block; there is nothing to say, so say nothing.
+            # ASSUMPTION, not in the Converse schema: some model families reject a blank text
+            # block at runtime. There is nothing to say, so say nothing.
             return {"text": text} if text.strip() else None
         case ToolUseBlock(id, name, tool_input):
             return {"toolUse": {"toolUseId": id, "name": name, "input": _json(dict(tool_input))}}
@@ -186,16 +187,21 @@ class BedrockProvider(ModelProvider):
 
     def _get_client(self) -> ConverseClient:
         # Built on first use, not at construction, so importing or configuring this class needs
-        # neither boto3 credentials nor the network. A race between two first calls makes two
-        # clients and keeps one, which is harmless.
+        # neither boto3 credentials nor the network. Called only from `_call`, on a worker thread:
+        # `import boto3` and the credential lookup take hundreds of milliseconds, and doing that on
+        # the event-loop thread would stall every other coroutine and defeat the loop's wall-clock
+        # timeout on the first live call of a run. A race between two first calls makes two clients
+        # and keeps one, which is harmless.
         if self._client is None:
             self._client = make_client(self._region_name)
         return self._client
 
+    def _call(self, kwargs: dict[str, Any]) -> Mapping[str, Any]:
+        return self._get_client().converse(**kwargs)
+
     async def converse(self, request: ModelRequest) -> ModelResponse:
         kwargs = build_request(self._model_id, request)
-        client = self._get_client()
-        wire = await asyncio.to_thread(client.converse, **kwargs)
+        wire = await asyncio.to_thread(self._call, kwargs)
         return parse_response(wire)
 
 
