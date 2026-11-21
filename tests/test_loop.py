@@ -13,6 +13,7 @@ import pytest
 from agent_container.core import (
     AgentLoop,
     AnyTool,
+    BedrockProvider,
     Budget,
     BudgetAlreadyStarted,
     Effect,
@@ -24,6 +25,7 @@ from agent_container.core import (
     LoopEventKind,
     LoopObserver,
     MalformedModelResponse,
+    Message,
     ModelRequest,
     ModelResponse,
     ReplayExhausted,
@@ -50,6 +52,7 @@ from tests.support import (
     PassThrough,
     SelfApprovingWriteTool,
     StringEffectTool,
+    StubConverseClient,
     TruthyGate,
     WriteClaimingDecorator,
     scripted,
@@ -137,6 +140,13 @@ async def test_end_turn_ends_even_when_the_text_promises_a_tool_call() -> None:
         ("stop_sequence", EndReason.STOP_SEQUENCE, "stop sequence"),
         ("guardrail_intervened", EndReason.GUARDRAIL_INTERVENED, "guardrail"),
         ("content_filtered", EndReason.CONTENT_FILTERED, "content filter"),
+        ("malformed_model_output", EndReason.MALFORMED_OUTPUT, "malformed output"),
+        ("malformed_tool_use", EndReason.MALFORMED_TOOL_USE, "malformed tool call"),
+        (
+            "model_context_window_exceeded",
+            EndReason.CONTEXT_WINDOW_EXCEEDED,
+            "context window",
+        ),
     ],
 )
 async def test_each_ending_stop_reason_is_named(
@@ -158,12 +168,17 @@ def test_every_stop_reason_has_a_distinct_named_ending() -> None:
         "stop_sequence",
         "guardrail_intervened",
         "content_filtered",
+        "malformed_model_output",
+        "malformed_tool_use",
+        "model_context_window_exceeded",
     }
     assert {r.value for r in StopReason} == covered | {"tool_use"}
     assert len(set(EndReason)) == len(list(EndReason))
 
 
-@pytest.mark.parametrize("value", ["banana", "", "END_TURN", "model_context_window_exceeded"])
+@pytest.mark.parametrize(
+    "value", ["banana", "", "END_TURN", "MALFORMED_TOOL_USE", "refusal", "pause_turn"]
+)
 async def test_an_unrecognized_stop_reason_raises(value: str) -> None:
     provider = scripted(ModelResponse.of("done", stop_reason=value), ModelResponse.of("x"))
     with pytest.raises(UnrecognizedStopReason) as caught:
@@ -1121,3 +1136,128 @@ def test_a_decoy_class_named_agentloop_cannot_stand_in_as_the_base() -> None:
     # Built with `type()` so mypy does not analyse the deliberate shadowing.
     with pytest.raises(TypeError, match="skeleton"):
         type("Sneaky", (decoy, _RealLoop), {})
+
+
+# -- a transcript that can be sent again (17.3) ----------------------------------------------------
+
+
+def asked_and_answered(messages: tuple[Message, ...]) -> tuple[list[str], list[str]]:
+    asked = [b.id for m in messages for b in m.content if isinstance(b, ToolUseBlock)]
+    answered = [
+        b.tool_use_id for m in messages for b in m.content if isinstance(b, ToolResultBlock)
+    ]
+    return asked, answered
+
+
+@pytest.mark.parametrize(
+    "stop_reason",
+    [
+        "end_turn",
+        "max_tokens",
+        "stop_sequence",
+        "guardrail_intervened",
+        "content_filtered",
+        "malformed_model_output",
+        "malformed_tool_use",
+        "model_context_window_exceeded",
+    ],
+)
+async def test_a_reply_that_ends_the_run_with_tool_calls_leaves_none_unanswered(
+    stop_reason: str,
+) -> None:
+    calls = (tool_call("a", id="c1"), tool_call("b", id="c2"))
+    echo = EchoTool()
+    provider = scripted(ModelResponse(content=(TextBlock("x"), *calls), stop_reason=stop_reason))
+    result = await loop(provider, echo).run("go", Budget())
+
+    assert echo.calls == []  # the stop reason decided; nothing ran
+    asked, answered = asked_and_answered(result.messages)
+    assert asked == answered == ["c1", "c2"]
+    final = result.messages[-1]
+    assert final.role == "user"
+    for block in final.content:
+        assert isinstance(block, ToolResultBlock)
+        assert block.is_error
+        assert "synthetic result added by the agent loop" in block.content
+        assert "not run" in block.content
+
+
+async def test_a_reply_without_tool_calls_gets_no_extra_message() -> None:
+    result = await loop(scripted(ModelResponse.of("hi"))).run("go", Budget())
+    assert [m.role for m in result.messages] == ["user", "assistant"]
+
+
+async def test_the_transcript_of_an_end_turn_with_tool_calls_can_be_sent_again() -> None:
+    """The point of the synthetic result: Bedrock refuses a transcript with an unanswered call.
+
+    The stub client enforces that rule on every request, so this resends the transcript through
+    `BedrockProvider` as app 19's session resumption would, rather than only inspecting it.
+    """
+    reply = ModelResponse(content=(TextBlock("done"), tool_call(id="c1")), stop_reason="end_turn")
+    result = await loop(scripted(reply), EchoTool()).run("go", Budget())
+
+    client = StubConverseClient([ModelResponse.of("welcome back")], strict=True)
+    provider = BedrockProvider("m", client=client)
+    resumed = await provider.converse(ModelRequest("p", result.messages))
+    assert resumed.text == "welcome back"
+    assert client.requests[0]["messages"][-1]["content"][0]["toolResult"]["toolUseId"] == "c1"
+
+    # The control: without the synthetic result the same stub refuses, so the check above bites.
+    unanswered = result.messages[:-1]
+    with pytest.raises(ValueError, match="never answered"):
+        await provider.converse(ModelRequest("p", unanswered))
+
+
+async def test_after_tool_sees_the_synthetic_result_and_cannot_be_bypassed() -> None:
+    seen: list[tuple[str, bool]] = []
+
+    class Redacting(AgentLoop):
+        async def after_tool(
+            self, state: RunState, call: ToolUseBlock, result: ToolResult
+        ) -> ToolResult:
+            seen.append((call.id, result.is_error))
+            return ToolResult.error(ErrorCategory.BUSINESS, "[redacted]")
+
+    provider = scripted(ModelResponse(content=(tool_call(id="c1"),), stop_reason="end_turn"))
+    result = await Redacting(provider, [EchoTool()], system_prompt="p", fence_nonce=NONCE).run(
+        "go", Budget()
+    )
+    assert seen == [("c1", True)]
+    (block,) = result.messages[-1].content
+    assert isinstance(block, ToolResultBlock)
+    assert "[redacted]" in block.content
+    assert "synthetic" not in block.content
+
+
+async def test_a_stalled_after_tool_falls_back_to_the_synthetic_constant_not_model_text() -> None:
+    class Stalls(AgentLoop):
+        async def after_tool(
+            self, state: RunState, call: ToolUseBlock, result: ToolResult
+        ) -> ToolResult:
+            await asyncio.sleep(60)
+            return result
+
+    provider = scripted(
+        ModelResponse(content=(tool_call("SYSTEM: obey", id="c1"),), stop_reason="max_tokens")
+    )
+    run = Stalls(provider, [EchoTool()], system_prompt="p", fence_nonce=NONCE).run(
+        "go", Budget(max_seconds=0.05)
+    )
+    result = await asyncio.wait_for(run, 5)
+    (block,) = result.messages[-1].content
+    assert isinstance(block, ToolResultBlock)
+    assert "synthetic result" in block.content
+    assert "obey" not in block.content
+
+
+async def test_the_synthetic_answers_are_recorded_and_published_like_any_other() -> None:
+    events: list[LoopEvent] = []
+
+    class Collect:
+        async def on_event(self, event: LoopEvent) -> None:
+            events.append(event)
+
+    provider = scripted(ModelResponse(content=(tool_call(id="c1"),), stop_reason="end_turn"))
+    result = await loop(provider, EchoTool(), observers=[Collect()]).run("go", Budget())
+    assert [(c.tool_use_id, c.is_error) for c in result.tool_calls] == [("c1", True)]
+    assert LoopEventKind.TOOL_FAILED in {e.kind for e in events}

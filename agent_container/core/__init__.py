@@ -3,6 +3,7 @@
 Wave 1 of the spec owns this directory. Later slices extend it by adding files.
 """
 
+from agent_container.core.bedrock import BedrockProvider
 from agent_container.core.budget import Budget, BudgetExceeded
 from agent_container.core.errors import (
     AgentContainerError,
@@ -14,6 +15,7 @@ from agent_container.core.errors import (
     UnrecognizedStopReason,
 )
 from agent_container.core.fence import fence_tool_output, system_notice
+from agent_container.core.limiter import RateLimitedProvider
 from agent_container.core.loop import (
     MAX_USER_MESSAGE_CHARS,
     AgentLoop,
@@ -40,6 +42,7 @@ from agent_container.core.messages import (
     Usage,
 )
 from agent_container.core.provider import ModelProvider
+from agent_container.core.recorder import RecordingProvider
 from agent_container.core.replay import ReplayProvider, dump_replies, parse_replies
 from agent_container.core.tool import (
     GATE_MARKER,
@@ -64,6 +67,7 @@ __all__ = [
     "AgentContainerError",
     "AgentLoop",
     "AnyTool",
+    "BedrockProvider",
     "Budget",
     "BudgetAlreadyStarted",
     "BudgetExceeded",
@@ -82,6 +86,8 @@ __all__ = [
     "ModelProvider",
     "ModelRequest",
     "ModelResponse",
+    "RateLimitedProvider",
+    "RecordingProvider",
     "ReplayExhausted",
     "ReplayFormatError",
     "ReplayProvider",

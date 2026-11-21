@@ -3,10 +3,10 @@
 from agent_container.testing import ModelProviderContract
 
 class TestMyProvider(ModelProviderContract):
-    def make_provider(self, replies):
+    def make_provider(self, replies, probe=None):
         return MyProvider(...)  # one that answers with exactly these replies, in order
 """
 
-from agent_container.testing.contracts import ModelProviderContract, ToolContract
+from agent_container.testing.contracts import ModelProviderContract, OverlapProbe, ToolContract
 
-__all__ = ["ModelProviderContract", "ToolContract"]
+__all__ = ["ModelProviderContract", "OverlapProbe", "ToolContract"]

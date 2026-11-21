@@ -2,21 +2,40 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import copy
+import threading
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 from pydantic import BaseModel
 
 from agent_container.core import (
     AnyTool,
     Effect,
+    ModelRequest,
     ModelResponse,
     ReplayProvider,
+    TextBlock,
     Tool,
     ToolContext,
     ToolResult,
     ToolUseBlock,
     Usage,
 )
+from agent_container.testing import OverlapProbe
+
+
+class ProbedReplay(ReplayProvider):
+    """A `ReplayProvider` that honours an `OverlapProbe`, for the provider contract."""
+
+    def __init__(self, replies: Sequence[ModelResponse], probe: OverlapProbe | None = None) -> None:
+        super().__init__(replies)
+        self._probe = probe
+
+    async def converse(self, request: ModelRequest) -> ModelResponse:
+        if self._probe is not None:
+            await self._probe.wait_async()
+        return await super().converse(request)
 
 
 class EchoArgs(BaseModel):
@@ -160,3 +179,84 @@ def use_tool(*calls: ToolUseBlock, text: str = "", usage: Usage | None = None) -
 
 def scripted(*replies: ModelResponse) -> ReplayProvider:
     return ReplayProvider(list(replies))
+
+
+# -- a stand-in for the boto3 bedrock-runtime client ---------------------------------------------
+
+
+def to_wire(reply: ModelResponse) -> dict[str, Any]:
+    """A `ModelResponse` as the dict Bedrock's Converse API returns."""
+    content: list[dict[str, Any]] = []
+    for block in reply.content:
+        if isinstance(block, TextBlock):
+            content.append({"text": block.text})
+        elif isinstance(block, ToolUseBlock):
+            content.append(
+                {"toolUse": {"toolUseId": block.id, "name": block.name, "input": dict(block.input)}}
+            )
+    return {
+        "output": {"message": {"role": "assistant", "content": content}},
+        "stopReason": reply.stop_reason,
+        "usage": {
+            "inputTokens": reply.usage.input_tokens,
+            "outputTokens": reply.usage.output_tokens,
+            "totalTokens": reply.usage.total,  # required by the schema
+        },
+        "metrics": {"latencyMs": 1},  # required by the schema
+    }
+
+
+def check_transcript(messages: Sequence[Mapping[str, Any]]) -> None:
+    """Rules a resumed transcript must satisfy; raises `ValueError` on a break.
+
+    ASSUMPTIONS, not the API contract. Neither rule is in botocore's Converse schema (see
+    `tests/test_converse_schema.py` for what is): both are runtime rules that Bedrock applies per
+    model family. They are encoded here because the Anthropic models this track targets enforce
+    them, and a transcript that breaks them is what app 19's resumption must not send.
+
+    * roles alternate, starting with the user;
+    * every `toolUse` is answered by a `toolResult` with the same id in the very next message, and
+      a `toolResult` answers a call that was actually made.
+    """
+    pending: set[str] = set()
+    for i, message in enumerate(messages):
+        expected = "user" if i % 2 == 0 else "assistant"
+        if message["role"] != expected:
+            raise ValueError(f"message {i} is {message['role']}, expected {expected}")
+        results = {b["toolResult"]["toolUseId"] for b in message["content"] if "toolResult" in b}
+        if results != pending:
+            raise ValueError(f"message {i} answers {sorted(results)}, expected {sorted(pending)}")
+        pending = {b["toolUse"]["toolUseId"] for b in message["content"] if "toolUse" in b}
+    if pending and messages and messages[-1]["role"] == "assistant":
+        raise ValueError(f"tool calls {sorted(pending)} were never answered")
+
+
+class StubConverseClient:
+    """Answers `converse` with the given replies in order and records every request.
+
+    No network, no boto3. With `strict=True` it also refuses a transcript Bedrock would refuse.
+    """
+
+    def __init__(
+        self,
+        replies: Sequence[ModelResponse] = (),
+        *,
+        strict: bool = False,
+        probe: OverlapProbe | None = None,
+    ) -> None:
+        self._probe = probe
+        self._wire = [to_wire(r) for r in replies]
+        self._lock = threading.Lock()  # `converse` runs on worker threads
+        self._strict = strict
+        self.requests: list[dict[str, Any]] = []
+
+    def converse(self, **kwargs: Any) -> Mapping[str, Any]:
+        if self._probe is not None:
+            self._probe.wait_blocking()  # on the provider's worker thread
+        if self._strict:
+            check_transcript(kwargs["messages"])
+        with self._lock:
+            self.requests.append(copy.deepcopy(kwargs))
+            if not self._wire:
+                raise AssertionError("the stub client ran out of replies")
+            return self._wire.pop(0)

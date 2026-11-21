@@ -83,7 +83,16 @@ _log = logging.getLogger("agent_container.loop")
 # `_record` was added on 2026-11-20 when block-building moved out of `_run_tool` into it -- the
 # extraction silently took guarded behaviour out of the guard, which is the hazard to watch for
 # whenever this loop is refactored.
-_SKELETON = ("run", "_call_model", "_run_tool", "_record", "_finish", "_publish", "_hook")
+_SKELETON = (
+    "run",
+    "_call_model",
+    "_run_tool",
+    "_record",
+    "_answer_unrun",
+    "_finish",
+    "_publish",
+    "_hook",
+)
 
 
 class EndReason(StrEnum):
@@ -94,6 +103,9 @@ class EndReason(StrEnum):
     STOP_SEQUENCE = "stop_sequence"
     GUARDRAIL_INTERVENED = "guardrail_intervened"
     CONTENT_FILTERED = "content_filtered"
+    MALFORMED_OUTPUT = "malformed_output"  # stop reason malformed_model_output
+    MALFORMED_TOOL_USE = "malformed_tool_use"  # the model's tool call could not be parsed
+    CONTEXT_WINDOW_EXCEEDED = "context_window_exceeded"  # the conversation outgrew the model
     BUDGET_EXCEEDED = "budget_exceeded"
     STOPPED_BY_HOOK = "stopped_by_hook"  # a subclass's `should_stop` said so
 
@@ -104,6 +116,9 @@ _END_DETAIL = {
     EndReason.STOP_SEQUENCE: "the model emitted a stop sequence",
     EndReason.GUARDRAIL_INTERVENED: "a guardrail intervened and blocked the reply",
     EndReason.CONTENT_FILTERED: "the content filter blocked the reply",
+    EndReason.MALFORMED_OUTPUT: "the model produced malformed output",
+    EndReason.MALFORMED_TOOL_USE: "the model produced a malformed tool call",
+    EndReason.CONTEXT_WINDOW_EXCEEDED: "the conversation exceeded the model's context window",
 }
 
 
@@ -222,6 +237,17 @@ _HOOK_TIMED_OUT = _TimedOut()
 _CUT_OFF = ToolResult.error(
     ErrorCategory.TRANSIENT,
     "the tool was cut off: the run's time budget ran out",
+    retryable=False,
+)
+
+
+# The answer to a tool call in a reply whose stop reason ended the run. The call is not run: the
+# stop reason decides, not the presence of a tool call. It is answered anyway because an unanswered
+# `ToolUseBlock` makes the transcript unsendable. A fixed library string, never model text.
+_NOT_RUN = ToolResult.error(
+    ErrorCategory.BUSINESS,
+    "synthetic result added by the agent loop: this tool call was not run, because the reply "
+    "that carried it ended the run",
     retryable=False,
 )
 
@@ -416,8 +442,19 @@ class AgentLoop(metaclass=_LoopMeta):
                 )
             run.messages.append(Message("assistant", response.content))
 
-            # Branch on the stop reason. Every member is named; an unrecognized value raised above.
+            # `==`, not `is`: `StopReason` is a StrEnum.
             reason = StopReason.parse(response.stop_reason)
+            if reason != StopReason.TOOL_USE and response.tool_uses:
+                # The stop reason wins and nothing runs, but a call left unanswered would make
+                # `RunResult.messages` unsendable (Bedrock rejects it), and resuming a session
+                # sends it. Answer each with a labelled error, through `after_tool` as always.
+                run.messages.append(
+                    Message(
+                        "user", tuple(await self._answer_unrun(run, response.tool_uses, _NOT_RUN))
+                    )
+                )
+
+            # Branch on the stop reason. Every member is named; an unrecognized value raised above.
             match reason:
                 case StopReason.TOOL_USE:
                     if not response.tool_uses:
@@ -436,19 +473,12 @@ class AgentLoop(metaclass=_LoopMeta):
                         # Found by Codex on 2026-11-20.
                         if run.budget.remaining_seconds <= 0.0:
                             # Stop dispatching, but answer every call that is left. An
-                            # unanswered ToolUseBlock makes the transcript unsendable, and 17.3
-                            # owns making it resumable without being allowed to edit `core/`.
-                            for skipped in response.tool_uses[len(blocks) :]:
-                                # Through `after_tool` like any other result: its contract is
-                                # "adjust a tool's result before it is fenced and returned to the
-                                # model", and a cut-off result is fenced and returned. A subclass
-                                # redacting or annotating results must not have this one escape.
-                                cut = await self._hook(
-                                    run, self.after_tool(run.state(), skipped, _CUT_OFF)
+                            # unanswered ToolUseBlock makes the transcript unsendable.
+                            blocks.extend(
+                                await self._answer_unrun(
+                                    run, response.tool_uses[len(blocks) :], _CUT_OFF
                                 )
-                                if isinstance(cut, _TimedOut):
-                                    cut = _CUT_OFF
-                                blocks.append(await self._record(run, skipped, cut))
+                            )
                             exceeded = BudgetExceeded(
                                 "wall_clock", run.budget.elapsed, run.budget.max_seconds
                             )
@@ -478,6 +508,12 @@ class AgentLoop(metaclass=_LoopMeta):
                     return await self._finish(run, EndReason.GUARDRAIL_INTERVENED)
                 case StopReason.CONTENT_FILTERED:
                     return await self._finish(run, EndReason.CONTENT_FILTERED)
+                case StopReason.MALFORMED_MODEL_OUTPUT:
+                    return await self._finish(run, EndReason.MALFORMED_OUTPUT)
+                case StopReason.MALFORMED_TOOL_USE:
+                    return await self._finish(run, EndReason.MALFORMED_TOOL_USE)
+                case StopReason.MODEL_CONTEXT_WINDOW_EXCEEDED:
+                    return await self._finish(run, EndReason.CONTEXT_WINDOW_EXCEEDED)
                 case _:
                     assert_never(reason)
 
@@ -571,6 +607,27 @@ class AgentLoop(metaclass=_LoopMeta):
             ),
             is_error=result.is_error,
         )
+
+    async def _answer_unrun(
+        self, run: _Run, calls: Sequence[ToolUseBlock], result: ToolResult
+    ) -> list[ToolResultBlock]:
+        """Answer calls that will not be dispatched with `result`, one block each.
+
+        Every result goes through `after_tool` like any other: its contract is "adjust a tool's
+        result before it is fenced and returned to the model", and these are fenced and returned.
+        A subclass redacting or annotating results must not have this path escape it. On a stalled
+        hook it falls back to `result` itself, a constant of this module, never to anything a tool
+        or the model produced.
+        """
+        blocks: list[ToolResultBlock] = []
+        for call in calls:
+            adjusted = await self._hook(run, self.after_tool(run.state(), call, result))
+            blocks.append(
+                await self._record(
+                    run, call, result if isinstance(adjusted, _TimedOut) else adjusted
+                )
+            )
+        return blocks
 
     async def _finish(
         self,
