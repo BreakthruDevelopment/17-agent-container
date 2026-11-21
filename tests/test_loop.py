@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -638,3 +639,50 @@ async def test_no_tool_is_dispatched_once_the_wall_clock_has_expired() -> None:
 
     assert result.end_reason is EndReason.BUDGET_EXCEEDED
     assert len(ran) == 1, f"dispatched {len(ran)}; the second ran past the clock"
+
+
+def _read(clock: list[float]) -> float:
+    return clock[0]
+
+
+async def test_every_tool_call_is_answered_even_when_the_clock_stops_the_batch() -> None:
+    """A `ToolUseBlock` with no matching `ToolResultBlock` makes the transcript unsendable.
+
+    Bedrock rejects it on resend, which is exactly what app 19's session resumption does, and
+    17.3 owns making transcripts resumable without being allowed to edit `core/`. So stopping
+    dispatch must not mean dropping the answer. Swept across thresholds because the first version
+    of the wall-clock check was correct at some and broken at others.
+    """
+
+    class Slow(EchoTool):
+        """Each call eats ten seconds of the clock it is given."""
+
+        def __init__(self, clock: list[float]) -> None:
+            super().__init__()
+            self._clock = clock
+
+        async def run(self, args: object, ctx: object) -> ToolResult:
+            self._clock[0] += 10.0
+            return ToolResult.ok("x")
+
+    for cutoff in (0.0, 1.0, 5.0, 9.0, 11.0, 25.0):
+        now = [0.0]
+        calls = tuple(ToolUseBlock(f"c{i}", "echo", {"text": str(i)}) for i in range(3))
+        provider = scripted(
+            ModelResponse(content=calls, stop_reason="tool_use"),
+            ModelResponse.of("done"),
+        )
+        result = await loop(provider, Slow(now)).run(
+            "go", Budget(max_seconds=cutoff, clock=functools.partial(_read, now))
+        )
+
+        asked = [b.id for m in result.messages for b in m.content if isinstance(b, ToolUseBlock)]
+        answered = [
+            b.tool_use_id
+            for m in result.messages
+            for b in m.content
+            if isinstance(b, ToolResultBlock)
+        ]
+        assert asked == answered, f"cutoff={cutoff}: asked {asked}, answered {answered}"
+        for m in result.messages:
+            assert m.content, f"cutoff={cutoff}: empty message in the transcript"

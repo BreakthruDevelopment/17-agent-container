@@ -185,6 +185,15 @@ class _Run:
         )
 
 
+# The answer to a tool call the run had no time for, whether it was cut off mid-flight or never
+# dispatched. One definition so both paths report the same thing to the model.
+_CUT_OFF = ToolResult.error(
+    ErrorCategory.TRANSIENT,
+    "the tool was cut off: the run's time budget ran out",
+    retryable=False,
+)
+
+
 class AgentLoop:
     """Runs a model and a set of tools until the model's stop reason, or the budget, says stop."""
 
@@ -306,6 +315,11 @@ class AgentLoop:
                         # mid-batch would make `max_turns=1` mean "no tools at all".
                         # Found by Codex on 2026-11-20.
                         if run.budget.remaining_seconds <= 0.0:
+                            # Stop dispatching, but answer every call that is left. An
+                            # unanswered ToolUseBlock makes the transcript unsendable, and 17.3
+                            # owns making it resumable without being allowed to edit `core/`.
+                            for skipped in response.tool_uses[len(blocks) :]:
+                                blocks.append(await self._record(run, skipped, _CUT_OFF))
                             exceeded = BudgetExceeded(
                                 "wall_clock", run.budget.elapsed, run.budget.max_seconds
                             )
@@ -370,11 +384,7 @@ class AgentLoop:
                     result = await tool.invoke(call.input, ctx)
             except Exception as exc:
                 if isinstance(exc, TimeoutError) and scope.expired():
-                    result = ToolResult.error(
-                        ErrorCategory.TRANSIENT,
-                        "the tool was cut off: the run's time budget ran out",
-                        retryable=False,
-                    )
+                    result = _CUT_OFF
                 else:
                     # Log the type and the tool, not the message: it may carry user data.
                     _log.error("tool %s raised %s", _safe_name(call.name), type(exc).__name__)
@@ -387,6 +397,16 @@ class AgentLoop:
         # Every sink takes the sanitised name, not just the fence and the log line. The event bus
         # is where 17.5's JSON-lines logger sits, and RunResult is what a caller reports on, so a
         # model-chosen name must not arrive raw at either.
+        return await self._record(run, call, result)
+
+    async def _record(self, run: _Run, call: ToolUseBlock, result: ToolResult) -> ToolResultBlock:
+        """Turn a result into the block that answers `call`, recording and publishing it.
+
+        Every `ToolUseBlock` must be answered by a `ToolResultBlock` carrying the same id
+        (`messages.py`), or the transcript cannot be sent again -- which is what app 19's session
+        resumption does. So a call the loop declines to dispatch is answered here too, not left
+        dangling.
+        """
         safe = _safe_name(call.name)
         run.tool_calls.append(
             ToolCallRecord(run.turn, safe, call.id, result.is_error, result.error_category)
