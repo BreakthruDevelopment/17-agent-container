@@ -403,10 +403,19 @@ def test_every_private_method_is_in_the_skeleton() -> None:
     import inspect
 
     hooks = {"before_model", "after_tool", "should_stop"}
+
+    # `inspect.isfunction` does not see a `@staticmethod`, `@classmethod` or `@property`, so a
+    # future helper written as one would never reach `_SKELETON` and this test would stay green.
+    # That is the next version of the defect rounds 9 and 10 found, so unwrap the descriptors.
+    def is_callable_member(value: object) -> bool:
+        inner = getattr(value, "__func__", value)
+        inner = getattr(value, "fget", inner) if isinstance(value, property) else inner
+        return inspect.isfunction(inner) or inspect.iscoroutinefunction(inner)
+
     private = {
         name
         for name, value in vars(AgentLoop).items()
-        if inspect.isfunction(value) and name.startswith("_") and not name.startswith("__")
+        if is_callable_member(value) and name.startswith("_") and not name.startswith("__")
     }
     missing = sorted(private - set(_SKELETON))
     assert not missing, f"private methods not in _SKELETON: {missing}"
@@ -414,7 +423,7 @@ def test_every_private_method_is_in_the_skeleton() -> None:
     public = {
         name
         for name, value in vars(AgentLoop).items()
-        if inspect.isfunction(value) and not name.startswith("_")
+        if is_callable_member(value) and not name.startswith("_")
     }
     assert public == hooks | {"run"}, f"unexpected public surface: {sorted(public - hooks)}"
 

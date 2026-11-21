@@ -16,10 +16,11 @@ import asyncio
 import logging
 import secrets
 import uuid
+from abc import ABCMeta
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, assert_never, final
+from typing import Any, Protocol, assert_never, final
 
 from agent_container.core.budget import Budget, BudgetExceeded
 from agent_container.core.errors import InputTooLarge, MalformedModelResponse
@@ -199,8 +200,70 @@ _CUT_OFF = ToolResult.error(
 )
 
 
-class AgentLoop:
+class _LoopMeta(ABCMeta):
+    """Refuse a subclass that replaces any part of the skeleton.
+
+    This is a metaclass rather than `__init_subclass__` because that hook can be switched off:
+    a base ordered before `AgentLoop` that defines its own `__init_subclass__` and forgets
+    `super()` means the hook never runs, so the guard cannot police itself from inside it. A
+    metaclass runs on every class creation regardless. It extends `ABCMeta`, not `type`, so a
+    subclass may still be an ABC without a metaclass conflict.
+
+    The comparison is on what the MRO *resolves*, not on what the class *declares*: a mixin
+    ordered first supplies the method, which is how cross-cutting behaviour is normally written
+    and needs no intent to circumvent. Measured before this guard existed: such a subclass was
+    accepted and the model received unfenced tool output.
+    """
+
+    def __new__(
+        mcls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], /, **kwargs: Any
+    ) -> _LoopMeta:
+        cls = super().__new__(mcls, name, bases, namespace, **kwargs)
+        base = next((b for b in cls.__mro__[1:] if b.__name__ == "AgentLoop"), None)
+        if base is None:  # AgentLoop itself
+            return cls
+        replaced = [
+            member
+            for member in _SKELETON
+            if getattr(cls, member, None) is not getattr(base, member, None)
+        ]
+        # The guard is part of the skeleton too, by whichever route it arrives.
+        # A class between `cls` and `AgentLoop` that defines `__init_subclass__` is refused too:
+        # it no longer disables this guard (a metaclass runs regardless), but it would silence
+        # `AgentLoop`'s own hook for every descendant, and the next reader would reasonably
+        # assume the hook still fires. Identity comparison does not work here -- the implicit
+        # classmethod binds per class, so `getattr` differs even when inherited unchanged --
+        # so this asks which classes actually define one.
+        defines_hook = [
+            ancestor.__name__
+            for ancestor in cls.__mro__[: cls.__mro__.index(base)]
+            if "__init_subclass__" in vars(ancestor)
+        ]
+        if defines_hook:
+            replaced.append(f"__init_subclass__ (on {', '.join(defines_hook)})")
+        if replaced:
+            raise TypeError(
+                f"{name} overrides the loop skeleton ({', '.join(replaced)}); "
+                "override before_model, after_tool or should_stop instead"
+            )
+        return cls
+
+
+class AgentLoop(metaclass=_LoopMeta):
     """Runs a model and a set of tools until the model's stop reason, or the budget, says stop."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Consume PEP 487 class keyword arguments. The guard itself lives in `_LoopMeta`.
+
+        `class MyAgent(AgentLoop, tag="x")` otherwise fails on `object`'s default, which takes
+        none -- and the usual way round that, a base class before `AgentLoop` that consumes
+        them, is the ordering `_LoopMeta` refuses. So the arguments are consumed here rather
+        than forwarded; `AgentLoop` itself defines none and ignores whatever it is given.
+        Defining this hook on a subclass is still refused by the metaclass, so it cannot be
+        used to silence the guard.
+        """
+        del kwargs  # consumed, not forwarded: `object.__init_subclass__` accepts none
+        super().__init_subclass__()
 
     def __init__(
         self,
@@ -228,29 +291,6 @@ class AgentLoop:
         if fence_nonce is not None:
             check_nonce(fence_nonce)  # fail at construction, not on the first tool result
         self._fence_nonce = fence_nonce
-
-    def __init_subclass__(cls) -> None:
-        super().__init_subclass__()
-        # Compare what the MRO *resolves*, not what this class *declares*. `name in cls.__dict__`
-        # misses `class MyAgent(SomeBase, AgentLoop)`, where a base ordered before AgentLoop
-        # supplies the method instead -- which is how a cross-cutting mixin is normally written,
-        # so it needs no intent to circumvent. Measured before this change: such a subclass was
-        # accepted and the model received unfenced tool output with RunResult.tool_calls empty.
-        overridden = [
-            name
-            for name in _SKELETON
-            if getattr(cls, name, None) is not getattr(AgentLoop, name, None)
-        ]
-        # The guard itself is part of the skeleton: a subclass defining its own
-        # `__init_subclass__` without calling super() would disable it for every descendant.
-        # It is an implicit classmethod, so enumerating functions on the class does not list it.
-        if "__init_subclass__" in cls.__dict__:
-            overridden.append("__init_subclass__")
-        if overridden:
-            raise TypeError(
-                f"{cls.__name__} overrides the loop skeleton ({', '.join(overridden)}); "
-                "override before_model, after_tool or should_stop instead"
-            )
 
     # -- hooks: the only things a subclass may override ------------------------------------------
 
