@@ -7,6 +7,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "boto3>=1.35,<2",
     "pydantic>=2.9,<3",
+    "pyyaml>=6.0.1,<7",
 ]
 
 [project.scripts]
@@ -49,6 +50,11 @@ warn_unreachable = true
 # in the typed `ConverseClient` protocol straight away.
 [[tool.mypy.overrides]]
 module = ["boto3", "botocore", "botocore.*"]
+ignore_missing_imports = true
+
+# PyYAML ships no type information; `builder.py` calls `yaml.safe_load` and catches `YAMLError`.
+[[tool.mypy.overrides]]
+module = ["yaml"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
