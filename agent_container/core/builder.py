@@ -95,9 +95,17 @@ def load_manifest(text: str) -> Manifest:
     """Parse a YAML document into a `Manifest`. Values are not echoed in the error.
 
     That promise held for the validation path (`include_input=False`) and not for this one:
-    `str(YAMLError)` embeds a source excerpt, so a malformed manifest leaked whatever sat near
-    the error -- a `system_prompt`, a credential pasted into one. Only the parser's own problem
-    description and position are safe to repeat; neither contains document text.
+    `str(YAMLError)` embeds a source excerpt -- `Mark.__str__` calls `get_snippet()`, up to 75
+    characters of the buffer -- so a malformed manifest leaked whatever sat near the error: a
+    `system_prompt`, a credential pasted into one. Reading `.line`/`.column` off the mark
+    instead of stringifying it sidesteps the snippet.
+
+    `problem` is safe for VALUES, which is what the promise covers, not for every byte of the
+    document: three of PyYAML's problem strings repeat a YAML identifier -- `duplicate tag
+    handle %r`, `found undefined alias %r`, `could not determine a constructor for the tag %r`.
+    Those are structural tokens, never a scalar value. The one message that does echo a value,
+    `expected the empty value, but found %r`, lives in `FullConstructor` and is unreachable
+    from `safe_load`.
     """
     try:
         loaded: object = yaml.safe_load(text)
