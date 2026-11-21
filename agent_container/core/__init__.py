@@ -5,6 +5,14 @@ Wave 1 of the spec owns this directory. Later slices extend it by adding files.
 
 from agent_container.core.bedrock import BedrockProvider
 from agent_container.core.budget import Budget, BudgetExceeded
+from agent_container.core.builder import (
+    AgentBuilder,
+    Limits,
+    Manifest,
+    ManifestError,
+    UngatedWriteError,
+    load_manifest,
+)
 from agent_container.core.decorators import (
     Cached,
     Decorator,
@@ -24,6 +32,7 @@ from agent_container.core.errors import (
     StagedChangeError,
     UnrecognizedStopReason,
 )
+from agent_container.core.events import EVENTS, EventBus, ModelCalled, ToolCalled, ToolFailed
 from agent_container.core.fence import fence_tool_output, system_notice
 from agent_container.core.gate import PermissionGate, Policy, ToolCallChange
 from agent_container.core.interceptors import (
@@ -33,6 +42,12 @@ from agent_container.core.interceptors import (
     TurnOutputCap,
 )
 from agent_container.core.limiter import RateLimitedProvider
+from agent_container.core.log import (
+    EVENTS_LOGGER,
+    LOG_FIELDS,
+    JsonLinesSubscriber,
+    configure_json_lines_logging,
+)
 from agent_container.core.loop import (
     MAX_USER_MESSAGE_CHARS,
     AgentLoop,
@@ -79,8 +94,12 @@ from agent_container.core.tool import (
 )
 
 __all__ = [
+    "EVENTS",
+    "EVENTS_LOGGER",
     "GATE_MARKER",
+    "LOG_FIELDS",
     "MAX_USER_MESSAGE_CHARS",
+    "AgentBuilder",
     "AgentContainerError",
     "AgentLoop",
     "AnyTool",
@@ -94,19 +113,25 @@ __all__ = [
     "Effect",
     "EndReason",
     "ErrorCategory",
+    "EventBus",
     "Identity",
     "InputTooLarge",
     "Intercepted",
     "Interceptor",
     "InterceptorChain",
+    "JsonLinesSubscriber",
     "JsonObject",
+    "Limits",
     "LoopEvent",
     "LoopEventKind",
     "LoopObserver",
     "MalformedModelResponse",
+    "Manifest",
+    "ManifestError",
     "Message",
     "Metered",
     "Metrics",
+    "ModelCalled",
     "ModelProvider",
     "ModelRequest",
     "ModelResponse",
@@ -128,21 +153,26 @@ __all__ = [
     "Tool",
     "ToolCallChange",
     "ToolCallRecord",
+    "ToolCalled",
     "ToolChoice",
     "ToolContext",
+    "ToolFailed",
     "ToolMetrics",
     "ToolResult",
     "ToolResultBlock",
     "ToolSpec",
     "ToolUseBlock",
     "TurnOutputCap",
+    "UngatedWriteError",
     "UnrecognizedStopReason",
     "Usage",
     "WriteGate",
+    "configure_json_lines_logging",
     "dump_replies",
     "fence_tool_output",
     "has_write_gate",
     "innermost",
+    "load_manifest",
     "parse_replies",
     "system_notice",
     "walk_stack",
