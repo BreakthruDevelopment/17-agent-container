@@ -88,21 +88,41 @@ def test_grandchildren_charge_every_ancestor() -> None:
     assert root.turns_used == 2 and leaf.check() is not None
 
 
-async def test_parallel_children_stop_at_the_parent_with_bounded_overshoot() -> None:
-    parent = Budget(max_turns=5, max_tokens=10**9)
-    n = 4
-
-    async def agent(child: Budget) -> int:
-        calls = 0
+async def _drain(parent: Budget, leaves: list[Budget]) -> int:
+    async def agent(child: Budget) -> None:
         while child.check() is None:
             await asyncio.sleep(0)  # the "model call"
             child.record_turn(1)
-            calls += 1
-        return calls
 
-    counts = await asyncio.gather(*(agent(parent.child()) for _ in range(n)))
-    assert parent.turns_used == sum(counts) >= 5
-    assert parent.turns_used <= 5 + (n - 1)  # at most one in-flight call per other child
+    await asyncio.gather(*(agent(leaf) for leaf in leaves))
+    return parent.turns_used
+
+
+async def test_overshoot_is_bounded_by_the_concurrent_leaves_in_any_shape() -> None:
+    """The bound is leaves - 1, at any depth -- not the number of direct children."""
+    limit = 5
+
+    def flat(n: int) -> tuple[Budget, list[Budget]]:
+        p = Budget(max_turns=limit, max_tokens=10**9)
+        return p, [p.child() for _ in range(n)]
+
+    def tree(n: int) -> tuple[Budget, list[Budget]]:
+        p = Budget(max_turns=limit, max_tokens=10**9)
+        mid = p.child()
+        return p, [mid.child() for _ in range(n)]
+
+    for build, n in ((flat, 4), (tree, 4), (tree, 8)):
+        parent, leaves = build(n)
+        used = await _drain(parent, leaves)
+        assert limit <= used <= limit + n - 1, (build.__name__, n, used)
+    # the case that made "one per child" false: 8 grandchildren under one child
+    parent, leaves = tree(8)
+    assert await _drain(parent, leaves) == limit + 8 - 1
+    # and the limit holds exactly when the leaves run one at a time
+    parent, leaves = tree(8)
+    for leaf in leaves:
+        await _drain(parent, [leaf])
+    assert parent.turns_used == limit
 
 
 async def test_a_loop_runs_under_a_child_and_reports_the_parents_limit() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 
 import pytest
 from pydantic import JsonValue
@@ -149,7 +150,7 @@ async def test_a_cancelled_call_leaves_nothing_in_the_cache() -> None:
 
     cached = Cached(Hangs())
     task = asyncio.create_task(cached.run(EchoArgs(text="x"), ctx()))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -224,7 +225,7 @@ async def test_a_cancelled_apply_cannot_be_repeated() -> None:
     staged = (await PermissionGate(write).run(EchoArgs(text="x"), ctx())).staged
     assert staged is not None
     task = asyncio.create_task(staged.apply())
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -332,7 +333,7 @@ async def test_retrying_does_not_swallow_cancellation() -> None:
 
     tool = EchoTool(lambda a: ToolResult.error(ErrorCategory.TRANSIENT, "down"))
     task = asyncio.create_task(Retrying(tool, sleep=sleep).run(EchoArgs(text="x"), ctx()))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -500,14 +501,140 @@ async def test_the_cap_forgets_the_oldest_run_beyond_its_bound() -> None:
     assert cap.used("a", 1) == 0 and cap.used("c", 1) == 10
 
 
+SECRET = "sk-" + "9" * 20
+PATTERN = r"sk-\d{20}"
+
+
 async def test_a_cap_outside_redaction_cannot_leave_half_a_secret() -> None:
-    secret = "sk-" + "9" * 20
-    leaky = EchoTool(lambda a: ToolResult.ok("token " + secret))
-    cap = TurnOutputCap(15)  # cuts inside the secret
-    safe = Intercepted(Redacting(leaky, [r"sk-\d{20}"]), InterceptorChain([cap]))
+    leaky = EchoTool(lambda a: ToolResult.ok("token " + SECRET))
+    safe = Intercepted(Redacting(leaky, [PATTERN]), InterceptorChain([TurnOutputCap(15)]))
     assert "sk-" not in (await safe.run(EchoArgs(text="x"), ctx())).content
-    unsafe = Redacting(Intercepted(leaky, InterceptorChain([TurnOutputCap(15)])), [r"sk-\d{20}"])
-    assert "sk-" in (await unsafe.run(EchoArgs(text="x"), ctx())).content  # the wrong order leaks
+
+
+def test_a_cap_beneath_redaction_is_refused_at_construction_even_through_decorators() -> None:
+    capped = Intercepted(EchoTool(), InterceptorChain([TurnOutputCap(15)]))
+    with pytest.raises(ValueError, match="beneath Redacting"):
+        Redacting(capped, [PATTERN])
+    # a decorator, or three, in between does not hide it
+    with pytest.raises(ValueError, match="beneath Redacting"):
+        Redacting(Metered(Retrying(Metered(capped, Metrics())), Metrics()), [PATTERN])
+    # the cap beside other interceptors still counts
+    mixed = Intercepted(EchoTool(), InterceptorChain([Trace("a", []), TurnOutputCap(15)]))
+    with pytest.raises(ValueError, match="beneath Redacting"):
+        Redacting(mixed, [PATTERN])
+    # a chain without a cap is fine
+    Redacting(Intercepted(EchoTool(), InterceptorChain([Trace("a", [])])), [PATTERN])
+
+
+async def test_a_cache_hit_still_passes_through_the_cap() -> None:
+    cap = TurnOutputCap(5)
+    with pytest.raises(ValueError, match="bypassed by cache hits"):
+        Cached(Intercepted(big_tool(10), InterceptorChain([cap])))
+    # the order that works: the cap outside the cache charges every delivered result
+    tool = big_tool(10)
+    outer = Intercepted(Cached(tool), InterceptorChain([cap]))
+    a = EchoArgs(text="x")
+    delivered = [(await outer.run(a, ctx(turn=t))).content for t in (1, 1, 2)]
+    assert len(tool.calls) == 1  # the second and third were cache hits
+    assert delivered[0] == "x" * 5 + TURN_CAP_NOTICE
+    assert delivered[1] == TURN_CAP_OMITTED  # same turn: the allowance is spent
+    assert delivered[2] == "x" * 5 + TURN_CAP_NOTICE  # a new turn gets a new allowance
+    assert cap.used("r", 2) == 5
+
+
+# -- redaction on every path a person reads -------------------------------------------------------
+
+
+@pytest.mark.parametrize("offset", range(0, 1100, 11))
+async def test_a_secret_straddling_the_display_limit_is_redacted_before_it_is_shortened(
+    offset: int,
+) -> None:
+    gate = PermissionGate(CountingWrite())
+    once = Redacting(gate, [PATTERN])
+    twice = Redacting(once, [PATTERN])  # nested: the outer must see the unshortened text too
+    for tool in (once, twice):
+        staged = (await tool.run(EchoArgs(text="a" * offset + SECRET), ctx())).staged
+        assert staged is not None
+        assert "sk-" not in staged.description and "99999" not in staged.description
+
+
+async def test_a_failure_when_applying_is_redacted_too() -> None:
+    class Rejects(CountingWrite):
+        async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+            return ToolResult.error(ErrorCategory.BUSINESS, f"backend said {SECRET}")
+
+    class Raises(CountingWrite):
+        async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+            raise RuntimeError(f"connection string {SECRET}")
+
+    for write in (Rejects(), Raises()):
+        staged = (
+            await Redacting(PermissionGate(write), [PATTERN]).run(EchoArgs(text="x"), ctx())
+        ).staged
+        assert staged is not None
+        with pytest.raises(StagedChangeError) as caught:
+            await staged.apply()
+        assert "sk-" not in str(caught.value) and "[redacted]" in str(caught.value)
+        assert caught.value.__context__ is None and caught.value.__cause__ is None
+        with pytest.raises(StagedChangeError, match="already"):  # single use is unchanged
+            await staged.apply()
+
+
+async def test_redaction_does_not_turn_a_cancelled_apply_into_an_error() -> None:
+    started = asyncio.Event()
+
+    class Hangs(CountingWrite):
+        async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+            started.set()
+            await asyncio.sleep(3600)
+            return ToolResult.ok("never")
+
+    staged = (
+        await Redacting(PermissionGate(Hangs()), [PATTERN]).run(EchoArgs(text="x"), ctx())
+    ).staged
+    assert staged is not None
+    task = asyncio.create_task(staged.apply())
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    with pytest.raises(StagedChangeError, match="already"):
+        await asyncio.wait_for(staged.apply(), timeout=5)
+
+
+# -- identity subclasses --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Scoped(Identity):
+    tenant: str = ""
+
+
+def scoped(tenant: str) -> ToolContext:
+    return ToolContext("r", 1, "c", Scoped("alice", frozenset({"p"}), tenant))
+
+
+async def test_an_identity_subclass_cannot_silently_share_a_cache_entry() -> None:
+    tool = EchoTool()
+    cached = Cached(tool)
+    with pytest.raises(TypeError, match="key_for"):
+        await cached.run(EchoArgs(text="x"), scoped("acme"))
+    assert tool.calls == [] and len(cached) == 0
+
+
+async def test_key_for_lets_an_application_key_its_own_identity() -> None:
+    tool = EchoTool()
+
+    def key(identity: Identity) -> tuple[str, frozenset[str], str]:
+        assert isinstance(identity, Scoped)
+        return identity.subject, identity.permissions, identity.tenant
+
+    cached = Cached(tool, key_for=key)
+    a = EchoArgs(text="x")
+    await cached.run(a, scoped("acme"))
+    await cached.run(a, scoped("acme"))
+    await cached.run(a, scoped("globex"))  # same subject and permissions, another tenant
+    assert len(tool.calls) == 2 and len(cached) == 2
 
 
 # -- the shared tool contract, against every decorator and a full stack --------------------------

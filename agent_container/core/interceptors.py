@@ -44,6 +44,11 @@ class InterceptorChain:
     def __init__(self, interceptors: Sequence[Interceptor]) -> None:
         self._interceptors = tuple(interceptors)
 
+    @property
+    def caps_output(self) -> bool:
+        """Whether any interceptor cuts the output it returns (`truncates_output`)."""
+        return any(getattr(i, "truncates_output", False) is True for i in self._interceptors)
+
     async def run(
         self,
         tool: str,
@@ -72,6 +77,11 @@ class Intercepted[A: BaseModel](Decorator[A]):
         super().__init__(inner)
         self._chain = chain
 
+    @property
+    def caps_output(self) -> bool:
+        """Read by `Redacting` and `Cached`, which refuse a stack with a cap beneath them."""
+        return self._chain.caps_output
+
     async def run(self, args: A, ctx: ToolContext) -> ToolResult:
         return await self._chain.run(self.name, args, ctx, lambda: self._inner.run(args, ctx))
 
@@ -94,8 +104,15 @@ class TurnOutputCap(Interceptor):
     top. Charging is synchronous (no `await` between reading and updating the total), so
     concurrent calls cannot both be admitted on the same remaining room. Turns of a run are
     tracked in an LRU of `max_runs` runs; a run evicted by more than that many concurrent runs
-    starts its turn's count again.
+    starts its turn's count again; that is a memory-for-accuracy trade, not closed by anything
+    else here.
+
+    Stack order is enforced, not advised: `truncates_output` makes `Redacting` and `Cached`
+    refuse to be built over a stack holding a cap (a cut can split a secret before it is
+    redacted; a cache hit never reaches the cap). Put the cap outside both.
     """
+
+    truncates_output = True
 
     def __init__(self, max_chars: int = DEFAULT_MAX_TURN_CHARS, *, max_runs: int = 4096) -> None:
         if max_chars < 1 or max_runs < 1:

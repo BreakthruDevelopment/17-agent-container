@@ -10,11 +10,12 @@ import asyncio
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Hashable, Iterable
 from dataclasses import dataclass, replace
 
 from pydantic import BaseModel
 
+from agent_container.core.errors import StagedChangeError
 from agent_container.core.tool import (
     AnyTool,
     Effect,
@@ -23,6 +24,7 @@ from agent_container.core.tool import (
     Tool,
     ToolContext,
     ToolResult,
+    walk_stack,
 )
 
 
@@ -58,6 +60,22 @@ class Decorator[A: BaseModel](Tool[A]):
 
 Sleep = Callable[[float], Awaitable[None]]
 
+# A member of a stack that cuts tool output sets this to True (`Intercepted` reports it for its
+# chain). Read by attribute, as the gate marker is, so this module need not import the cap.
+CAPS_OUTPUT_MARKER = "caps_output"
+
+# The longest staged-change description a person is shown. Applied last, after redaction.
+MAX_DESCRIPTION_CHARS = 1000
+
+
+def stack_caps_output(tool: AnyTool) -> bool:
+    """Whether anything in this stack (the tool included) cuts the output it returns."""
+    return any(getattr(member, CAPS_OUTPUT_MARKER, False) is True for member in walk_stack(tool))
+
+
+def limit_description(text: str) -> str:
+    return text if len(text) <= MAX_DESCRIPTION_CHARS else text[:MAX_DESCRIPTION_CHARS] + "..."
+
 
 class Retrying[A: BaseModel](Decorator[A]):
     """Run the tool again when it answers with a retryable error, up to `max_attempts` in all.
@@ -66,8 +84,11 @@ class Retrying[A: BaseModel](Decorator[A]):
     loop turns it into an internal, non-retryable result) and neither is cancellation. The delay
     doubles from `base_delay` up to `max_delay`; `sleep` is injectable so tests do not wait.
 
-    Retrying repeats the tool, so put it beneath a `PermissionGate` for a write: the gate then
-    stages once and the retries happen when a person approves, not before.
+    Placement: a `PermissionGate` stages a write with an ordinary `ok` result, which is never
+    retried. So `Retrying(PermissionGate(write))` retries nothing and the write runs once, when
+    approved; `PermissionGate(Retrying(write))` retries the write itself when it is applied. No
+    write happens before approval in either order -- the order decides only whether the applied
+    call is retried.
     """
 
     def __init__(
@@ -100,7 +121,17 @@ class Retrying[A: BaseModel](Decorator[A]):
 
 
 def identity_key(identity: Identity) -> tuple[str, tuple[str, ...]]:
-    """What distinguishes one caller from another: who they are and what they may do."""
+    """What distinguishes one caller from another: who they are and what they may do.
+
+    Only for a plain `Identity`. A subclass may carry fields (a tenant, say) this does not read,
+    and keying on a subset would let two callers share an entry, so it raises rather than guess.
+    `Cached(key_for=...)` is how an application says what makes its own identity type distinct.
+    """
+    if type(identity) is not Identity:
+        raise TypeError(
+            f"cannot key a cache on {type(identity).__name__}: it may carry fields the default "
+            "key does not read; pass key_for= to Cached"
+        )
     return identity.subject, tuple(sorted(identity.permissions))
 
 
@@ -117,6 +148,13 @@ class Cached[A: BaseModel](Decorator[A]):
     own). Entries are not coalesced, so two simultaneous identical calls both run. Nothing is
     stored until a call finishes, so a cancelled call leaves no entry. `max_entries` bounds
     memory (least recently used goes first); `ttl` seconds bounds age, off by default.
+
+    A hit returns without running anything beneath, so a `TurnOutputCap` beneath a `Cached` would
+    never see the delivered result and the cap would be bypassed. Construction refuses that;
+    put the cap outside the cache, where it charges every result, hits included.
+
+    The default key accepts a plain `Identity` only; for a subclass pass `key_for`, which must
+    return something hashable that includes every field distinguishing one caller from another.
     """
 
     def __init__(
@@ -126,8 +164,13 @@ class Cached[A: BaseModel](Decorator[A]):
         max_entries: int = 256,
         ttl: float | None = None,
         clock: Callable[[], float] = time.monotonic,
+        key_for: Callable[[Identity], Hashable] = identity_key,
     ) -> None:
         super().__init__(inner)
+        if stack_caps_output(inner):
+            raise ValueError(
+                "a TurnOutputCap beneath a Cached is bypassed by cache hits; put it outside"
+            )
         if max_entries < 1:
             raise ValueError("max_entries must be at least 1")
         if ttl is not None and ttl <= 0:
@@ -135,13 +178,14 @@ class Cached[A: BaseModel](Decorator[A]):
         self._max_entries = max_entries
         self._ttl = ttl
         self._clock = clock
+        self._key_for = key_for
         self._entries: OrderedDict[tuple[object, ...], tuple[float, ToolResult]] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self._entries)
 
     async def run(self, args: A, ctx: ToolContext) -> ToolResult:
-        key = (*identity_key(ctx.identity), self.name, args.model_dump_json())
+        key = (self._key_for(ctx.identity), self.name, args.model_dump_json())
         hit = self._entries.get(key)
         if hit is not None:
             stored_at, result = hit
@@ -159,25 +203,46 @@ class Cached[A: BaseModel](Decorator[A]):
 
 
 class _RedactedStaged(StagedChange):
-    """A staged change whose description a person reads with the secrets removed."""
+    """A staged change a person reads, and is told about, with the secrets removed.
+
+    Three paths carry text from the change to a person, and all three go through the redactor:
+    the description (redacted whole, *then* shortened, so a secret straddling the display limit
+    cannot survive as a fragment), and the message of any failure when applying.
+    """
 
     def __init__(self, change: StagedChange, redact: Callable[[str], str]) -> None:
         self._change = change
         self._redact = redact
 
     @property
+    def full_description(self) -> str:
+        """Redacted, not shortened. An outer wrapper redacts this again before shortening."""
+        full = getattr(self._change, "full_description", None)
+        return self._redact(full if isinstance(full, str) else self._change.description)
+
+    @property
     def description(self) -> str:
-        return self._redact(self._change.description)
+        return limit_description(self.full_description)
 
     async def apply(self) -> None:
-        await self._change.apply()
+        failure: str | None = None
+        try:
+            await self._change.apply()
+        except StagedChangeError as exc:
+            failure = str(exc)
+        except Exception as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+        if failure is not None:
+            # Raised outside the `except`, so the raw exception is not kept as `__context__`.
+            raise StagedChangeError(self._redact(failure))
 
 
 class Redacting[A: BaseModel](Decorator[A]):
     """Replace anything matching a pattern in the result, and in a staged change's description.
 
-    One pass per pattern, in order. Put a length cap (`TurnOutputCap`) *outside* this, not inside:
-    cutting a secret in half before redaction leaves a fragment no pattern matches.
+    One pass per pattern, in order. A length cap (`TurnOutputCap`) must sit *outside* this:
+    cutting a secret in half before redaction leaves a fragment no pattern matches. Construction
+    refuses a cap anywhere beneath, through any decorators between.
     """
 
     def __init__(
@@ -188,6 +253,11 @@ class Redacting[A: BaseModel](Decorator[A]):
         replacement: str = "[redacted]",
     ) -> None:
         super().__init__(inner)
+        if stack_caps_output(inner):
+            raise ValueError(
+                "a TurnOutputCap beneath Redacting can cut a secret before it is redacted; "
+                "put the cap outside"
+            )
         self._patterns = tuple(re.compile(p) for p in patterns)
         self._replacement = replacement
 
@@ -258,6 +328,7 @@ class Metered[A: BaseModel](Decorator[A]):
 
 
 __all__ = [
+    "CAPS_OUTPUT_MARKER",
     "Cached",
     "Decorator",
     "Metered",

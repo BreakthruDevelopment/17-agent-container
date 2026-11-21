@@ -6,7 +6,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
-from agent_container.core.decorators import Decorator
+from agent_container.core.decorators import Decorator, limit_description
 from agent_container.core.errors import StagedChangeError
 from agent_container.core.tool import (
     ErrorCategory,
@@ -16,8 +16,6 @@ from agent_container.core.tool import (
     ToolResult,
     writes,
 )
-
-MAX_DESCRIPTION_ARGS_CHARS = 500
 
 
 class Policy(StrEnum):
@@ -42,11 +40,14 @@ class ToolCallChange[A: BaseModel](StagedChange):
         self._attempted = False
 
     @property
-    def description(self) -> str:
+    def full_description(self) -> str:
+        """Everything, unshortened. A wrapper that redacts reads this, then shortens."""
         shown = self._args.model_dump_json()
-        if len(shown) > MAX_DESCRIPTION_ARGS_CHARS:
-            shown = shown[:MAX_DESCRIPTION_ARGS_CHARS] + "..."
         return f"{self._tool.name}: {self._tool.description} (arguments: {shown})"
+
+    @property
+    def description(self) -> str:
+        return limit_description(self.full_description)
 
     async def apply(self) -> None:
         if self._attempted:

@@ -94,9 +94,14 @@ class Budget:
         runs from the first subagent. Read `check()` on the child, which also reports an exhausted
         ancestor, and the loop already does.
 
-        Limit, stated exactly: a limit is checked before a model call and spent after it. Children
-        that run in parallel can each pass the check with one turn left, so the parent may end
-        past its limit by at most one in-flight call per child. Nothing here reserves in advance.
+        Limit, stated exactly: a limit is checked before a model call and spent after it, and
+        nothing reserves in advance. Budgets that run concurrently can therefore each pass the
+        check while the allowance has one turn left. The overshoot of `max_turns` is bounded by
+        the number of *leaf* budgets running at once, minus one -- every budget that actually
+        makes calls, at any depth, not the number of direct children: one child with eight
+        grandchildren overshoots as much as nine siblings would. Tokens and seconds overshoot by
+        whatever the in-flight calls spend or take, which has no bound here. A coordinator that
+        needs a hard turn cap must limit how many subagents run at once.
         """
         return Budget(
             max_turns=self.max_turns if max_turns is None else max_turns,
