@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import pytest
-from pydantic import JsonValue
+from pydantic import BaseModel, JsonValue
 
 from agent_container.core import (
     AgentLoop,
@@ -27,6 +27,7 @@ from agent_container.core import (
     Redacting,
     Retrying,
     StagedChangeError,
+    Tool,
     ToolContext,
     ToolResult,
     TurnOutputCap,
@@ -736,3 +737,78 @@ async def test_apply_never_reports_success_for_a_result_it_did_not_execute() -> 
         await staged.apply()
     with pytest.raises(StagedChangeError, match="already"):  # the approval is spent, and says so
         await staged.apply()
+
+
+# -- what a person reads is what executes ---------------------------------------------------------
+
+
+class Transfer(BaseModel):
+    to: str
+    amount: int
+    memo: list[str] = []
+
+
+class TransferTool(Tool[Transfer]):
+    name = "transfer"
+    description = "Move money."
+    effect = Effect.WRITE
+    input_model = Transfer
+
+    def __init__(self) -> None:
+        self.done: list[tuple[str, int, tuple[str, ...]]] = []
+
+    async def run(self, args: Transfer, ctx: ToolContext) -> ToolResult:
+        self.done.append((args.to, args.amount, tuple(args.memo)))
+        return ToolResult.ok("sent")
+
+
+async def test_a_batch_staged_from_one_reused_model_executes_what_was_shown() -> None:
+    tool = TransferTool()
+    gate = PermissionGate(tool)
+    shared = Transfer(to="", amount=0)
+    staged = []
+    shown = []
+    for to, amount in (("alice", 10), ("bob", 20), ("carol", 30)):
+        shared.to, shared.amount = to, amount  # the same model, restaged
+        change = (await gate.run(shared, ctx())).staged
+        assert change is not None
+        shown.append(change.description)
+        staged.append(change)
+    for change in staged:
+        await change.apply()
+    assert tool.done == [("alice", 10, ()), ("bob", 20, ()), ("carol", 30, ())]
+    assert all(to in text for (to, _, _), text in zip(tool.done, shown, strict=True))
+
+
+async def test_mutating_the_model_after_staging_cannot_change_what_runs() -> None:
+    """The sequence: stage, read, mutate (a field and a nested one), then apply."""
+    tool = TransferTool()
+    args = Transfer(to="approved-target", amount=5, memo=["rent"])
+    change = (await PermissionGate(tool).run(args, ctx())).staged
+    assert change is not None
+    before = change.description
+    args.to = "different-target"
+    args.memo.append("injected")  # nested: a shallow copy would share this list
+    args.memo[0] = "changed"
+    assert change.description == before
+    await change.apply()
+    assert tool.done == [("approved-target", 5, ("rent",))]
+
+
+async def test_an_after_hook_that_mutates_the_model_cannot_reach_the_staged_change() -> None:
+    class Mutates(Interceptor):
+        async def after(
+            self, tool: str, args: BaseModel, ctx: ToolContext, result: ToolResult
+        ) -> ToolResult:
+            if isinstance(args, Transfer):
+                args.to = "hijacked"
+                args.memo.append("hijacked")
+            return result
+
+    tool = TransferTool()
+    gated = PermissionGate(tool)
+    wrapped = Intercepted(gated, InterceptorChain([Mutates()]))
+    change = (await wrapped.run(Transfer(to="approved", amount=1), ctx())).staged
+    assert change is not None
+    await change.apply()
+    assert tool.done == [("approved", 1, ())]

@@ -36,7 +36,12 @@ class ToolCallChange[A: BaseModel](StagedChange):
 
     def __init__(self, tool: Tool[A], args: A, ctx: ToolContext) -> None:
         self._tool = tool
-        self._args = args
+        # A snapshot, deep: what a person reads in `description` must be what `apply()` runs. The
+        # caller's model is mutable and may be reused to stage the next call (a batch), or be
+        # changed by an interceptor's `after` hook once staging has returned; a shared reference
+        # would let any of that rewrite an operation already shown for approval. Deep, because a
+        # nested list or model is the same hazard one level down.
+        self._args = args.model_copy(deep=True)
         self._ctx = ctx
         self._attempted = False
 
