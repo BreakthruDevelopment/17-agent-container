@@ -8,6 +8,7 @@ A tool is wrapped by composition. `Retrying`, `Cached`, `Redacting`, `Metered` (
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -22,6 +23,12 @@ class Effect(StrEnum):
 
     READ = "read"
     WRITE = "write"
+
+
+# A tool name is an identifier. One definition, used by the loop at dispatch and by the provider
+# contract suite -- two copies drifted once already, and a test can only pin the copy it imports.
+# `\Z`, not `$`: in Python `$` also matches before a trailing newline, so `"echo\n"` would pass.
+TOOL_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 
 class ErrorCategory(StrEnum):

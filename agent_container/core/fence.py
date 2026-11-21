@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from agent_container.core.tool import ErrorCategory
 
 MAX_TOOL_OUTPUT_CHARS = 20_000
@@ -35,12 +37,7 @@ def fence_tool_output(
     `MAX_TOOL_OUTPUT_CHARS` is cut and says so. The header attributes are written by the library,
     not the tool.
     """
-    if not nonce:
-        # An empty nonce renders `fence=`, which tool output can close exactly -- measured at two
-        # closing markers, i.e. no fence at all. It also makes `_strip_nonce` non-terminating,
-        # since `"" in value` is always true. Refuse at the top, before anything touches it:
-        # `fence_tool_output` is exported, so 17.3 and 17.4 reach it directly.
-        raise ValueError("a fence nonce is required")
+    check_nonce(nonce)
 
     # Cap BEFORE stripping, not after. Stripping to a fixed point is O(passes x length) and the
     # caller chooses the pass count -- nesting N[0] + S + N[1:] needs one pass per layer -- so
@@ -64,6 +61,29 @@ def fence_tool_output(
 
 
 MAX_ATTR_CHARS = 200
+
+# A nonce is what the whole fence rests on, so its shape is checked rather than assumed.
+# `secrets.token_hex(8)` is what the loop generates; this allows any hex-like token of a usable
+# length and nothing else.
+NONCE_PATTERN = re.compile(r"\A[A-Za-z0-9]{8,64}\Z")
+
+
+def check_nonce(nonce: str) -> None:
+    """Refuse a nonce that cannot carry a fence.
+
+    Emptiness is not the only bad value, which is what an earlier version of this guard assumed.
+    A nonce containing `>` renders a header the body can close exactly: with `a>b`, the block
+    holds two closing tags at column 0 and the system notice tells the model to trust a token
+    that contains its own terminator. A one- or two-character nonce is worse than useless -- it
+    appears by chance in ordinary text, and stripping it shreds legitimate output ("the answer is
+    nine" became "the aswer is ie"). `fence_tool_output` is exported and `AgentLoop` takes
+    `fence_nonce` from its caller, so both check here rather than trusting the generator.
+    """
+    if not NONCE_PATTERN.match(nonce):
+        raise ValueError(
+            "a fence nonce must be 8-64 alphanumeric characters; "
+            f"got {len(nonce)} character(s) that do not match"
+        )
 
 
 def _strip_nonce(value: str, nonce: str) -> str:

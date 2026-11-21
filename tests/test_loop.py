@@ -590,6 +590,15 @@ def test_the_tool_name_pattern_rejects_a_trailing_newline() -> None:
     Without this the pattern accepted "echo\\n", so a name could carry a newline into a JSON log
     line. Untested until round 4: reverting `\\Z` to `$` passed all 117 tests.
     """
+    from agent_container.core.tool import TOOL_NAME_PATTERN
+    from agent_container.testing.contracts import _TOOL_NAME as shipped
+
+    # One definition: the loop's and the shipped contract suite's are the same object, so a test
+    # of one pins both. They were separate copies, and reverting `\Z` in the shipped copy passed
+    # the whole suite.
+    assert _TOOL_NAME is TOOL_NAME_PATTERN
+    assert shipped is TOOL_NAME_PATTERN
+
     assert _TOOL_NAME.match("echo")
     assert not _TOOL_NAME.match("echo\n")
     assert not _TOOL_NAME.match("a" * 64 + "\n")

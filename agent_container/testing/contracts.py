@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
-import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 
@@ -32,6 +31,7 @@ from agent_container.core.messages import (
 )
 from agent_container.core.provider import ModelProvider
 from agent_container.core.tool import (
+    TOOL_NAME_PATTERN,
     AnyTool,
     Effect,
     ErrorCategory,
@@ -41,7 +41,7 @@ from agent_container.core.tool import (
     walk_stack,
 )
 
-_TOOL_NAME = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")  # \Z, not $: `$` allows a trailing newline
+_TOOL_NAME = TOOL_NAME_PATTERN  # one definition, in core.tool
 
 
 def _require(condition: bool, message: str) -> None:

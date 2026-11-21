@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import secrets
 import uuid
 from collections.abc import Sequence
@@ -24,7 +23,7 @@ from typing import Protocol, assert_never, final
 
 from agent_container.core.budget import Budget, BudgetExceeded
 from agent_container.core.errors import InputTooLarge, MalformedModelResponse
-from agent_container.core.fence import fence_tool_output, system_notice
+from agent_container.core.fence import check_nonce, fence_tool_output, system_notice
 from agent_container.core.messages import (
     Message,
     ModelRequest,
@@ -36,6 +35,7 @@ from agent_container.core.messages import (
 )
 from agent_container.core.provider import ModelProvider
 from agent_container.core.tool import (
+    TOOL_NAME_PATTERN,
     AnyTool,
     ErrorCategory,
     Identity,
@@ -48,7 +48,7 @@ MAX_USER_MESSAGE_CHARS = 8_000
 
 # A tool name is an identifier. The same shape the provider contract enforces, applied at the
 # boundary so a model-chosen name never reaches a fenced result, a header or a log line.
-_TOOL_NAME = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")  # \Z, not $: `$` allows a trailing newline
+_TOOL_NAME = TOOL_NAME_PATTERN  # one definition, in core.tool
 
 
 def _safe_name(name: str) -> str:
@@ -211,6 +211,8 @@ class AgentLoop:
         self._identity = identity or Identity.anonymous()
         self._observers = tuple(observers)
         self._max_reply_tokens = max_reply_tokens
+        if fence_nonce is not None:
+            check_nonce(fence_nonce)  # fail at construction, not on the first tool result
         self._fence_nonce = fence_nonce
 
     def __init_subclass__(cls) -> None:
