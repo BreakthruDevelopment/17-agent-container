@@ -50,8 +50,10 @@ from agent_container.core.tool import (
     Tool,
     ToolContext,
     ToolResult,
+    has_write_gate,
     innermost,
     walk_stack,
+    writes,
 )
 
 __all__ = [
@@ -97,8 +99,10 @@ __all__ = [
     "Usage",
     "dump_replies",
     "fence_tool_output",
+    "has_write_gate",
     "innermost",
     "parse_replies",
     "system_notice",
     "walk_stack",
+    "writes",
 ]

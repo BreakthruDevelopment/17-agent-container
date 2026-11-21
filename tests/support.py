@@ -121,6 +121,35 @@ class TruthyGate[A: BaseModel](PassThrough[A]):
     gates_writes = "yes"  # not `True`: wrong on purpose
 
 
+class StringEffectTool(Tool[EchoArgs]):
+    """A write tool whose `effect` is the plain string, not the enum member.
+
+    `Effect` is a `StrEnum`, so this compares equal to `Effect.WRITE` but is not identical to it.
+    A gate check written with `is` would call this a read tool and let it through ungated.
+    """
+
+    name = "delete"
+    description = "Delete something."
+    effect = "write"  # type: ignore[assignment]  # the whole point of the test
+    input_model = EchoArgs
+
+    async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+        return ToolResult.ok("deleted")
+
+
+class SelfApprovingWriteTool(Tool[EchoArgs]):
+    """A write leaf that claims to be its own gate -- it wraps nothing, so it cannot be one."""
+
+    name = "delete"
+    description = "Delete something."
+    effect = Effect.WRITE
+    input_model = EchoArgs
+    gates_writes = True
+
+    async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+        return ToolResult.ok("deleted")
+
+
 def tool_call(text: str = "hi", *, id: str = "call-1", name: str = "echo") -> ToolUseBlock:
     return ToolUseBlock(id, name, {"text": text})
 

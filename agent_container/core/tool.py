@@ -235,8 +235,14 @@ def writes(tool: AnyTool) -> bool:
     Deliberately `any`, not `innermost(...).effect`: a decorator that reported `READ` over a write
     leaf would otherwise slip a write tool past the gate check. A stack is a write stack if any
     member says so.
+
+    `==`, not `is`: `Effect` is a `StrEnum`, so a tool whose `effect` is the plain string "write"
+    compares equal but is not identical. `is` would call such a tool a read and let it past the
+    gate -- a security check failing open. `==` fails closed and costs nothing. (`mypy --strict`
+    and the provider contract suite each catch the plain string too, but neither runs at the
+    moment this decision is made.)
     """
-    return any(member.effect is Effect.WRITE for member in walk_stack(tool))
+    return any(member.effect == Effect.WRITE for member in walk_stack(tool))
 
 
 def has_write_gate(tool: AnyTool) -> bool:
@@ -245,5 +251,12 @@ def has_write_gate(tool: AnyTool) -> bool:
     Read by attribute rather than `isinstance`: a `runtime_checkable` Protocol with a non-method
     member cannot be used with `isinstance`, and importing 17.4's concrete gate here would invert
     the dependency. `is True` so a truthy stub cannot pass for a gate.
+
+    A gate must also *wrap* something. Without that, a write tool could set `gates_writes = True`
+    on itself and approve its own writes; a decorator always has something beneath it, and a leaf
+    never does, so `wrapped is not None` separates the two with no cooperation from the author.
     """
-    return any(getattr(member, GATE_MARKER, False) is True for member in walk_stack(tool))
+    return any(
+        getattr(member, GATE_MARKER, False) is True and member.wrapped is not None
+        for member in walk_stack(tool)
+    )

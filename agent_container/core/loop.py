@@ -17,9 +17,10 @@ import logging
 import secrets
 import uuid
 from abc import ABCMeta
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Protocol, assert_never, final
 
 from agent_container.core.budget import Budget, BudgetExceeded
@@ -52,6 +53,11 @@ MAX_USER_MESSAGE_CHARS = 8_000
 # How long one observer may take per event. Telemetry is the expected observer and a stalled
 # exporter must not hold a run open, so this is a ceiling on reporting, not on work: exceeding it
 # is logged and the run carries on, exactly as an observer that raises already did.
+#
+# Per observer, per event, with no per-run total: n stalled observers cost n x this on every
+# event. That is deliberate while the shipped observer is a single event bus (17.5) -- a shared
+# deadline would make one slow observer silently truncate the others' notifications, which is
+# worse than being slow. Revisit if anything ever registers observers in bulk.
 OBSERVER_TIMEOUT_SECONDS = 5.0
 
 # A tool name is an identifier. The same shape the provider contract enforces, applied at the
@@ -309,7 +315,12 @@ class AgentLoop(metaclass=_LoopMeta):
                 )
             by_name[tool.name] = tool
         self._provider = provider
-        self._tools = by_name
+        # Read-only: the gate check above runs once, at construction, so a tool added to this
+        # dict afterwards would reach the model having passed nothing. A mapping proxy makes that
+        # a TypeError instead of a silent bypass. (`__init__` itself is deliberately *not* in
+        # `_SKELETON`: the metaclass guard must still allow the subclasses this slice makes room
+        # for.)
+        self._tools: Mapping[str, AnyTool] = MappingProxyType(by_name)
         self._specs = tuple(ToolSpec(t.name, t.description, t.input_schema()) for t in tools)
         self._system_prompt = system_prompt
         self._identity = identity or Identity.anonymous()
@@ -565,15 +576,25 @@ class AgentLoop(metaclass=_LoopMeta):
                 # happens *outside* them, so an unbounded `on_event` would outlive the budget it
                 # is reporting on -- including the final BUDGET_EXCEEDED event, and the publish
                 # that follows an `end_turn` response, which would strand a finished answer.
-                async with asyncio.timeout(OBSERVER_TIMEOUT_SECONDS):
+                async with asyncio.timeout(OBSERVER_TIMEOUT_SECONDS) as scope:
                     await observer.on_event(event)
             except TimeoutError:
-                _log.warning(
-                    "observer %s timed out after %ss on %s",
-                    type(observer).__name__,
-                    OBSERVER_TIMEOUT_SECONDS,
-                    kind,
-                )
+                # `expired()` distinguishes our bound from a `TimeoutError` the observer raised
+                # itself, which would otherwise be reported as a stall it never had. Same shape as
+                # the model-call and per-tool scopes above.
+                if scope.expired():
+                    _log.warning(
+                        "observer %s timed out after %ss on %s",
+                        type(observer).__name__,
+                        OBSERVER_TIMEOUT_SECONDS,
+                        kind,
+                    )
+                else:
+                    _log.warning(
+                        "observer %s failed on %s: TimeoutError",
+                        type(observer).__name__,
+                        kind,
+                    )
             except Exception as exc:
                 _log.warning(
                     "observer %s failed on %s: %s",

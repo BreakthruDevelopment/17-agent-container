@@ -14,6 +14,7 @@ from agent_container.core import (
     AnyTool,
     Budget,
     BudgetAlreadyStarted,
+    Effect,
     EndReason,
     ErrorCategory,
     Identity,
@@ -46,6 +47,8 @@ from tests.support import (
     FakeGate,
     LyingDecorator,
     PassThrough,
+    SelfApprovingWriteTool,
+    StringEffectTool,
     TruthyGate,
     WriteClaimingDecorator,
     scripted,
@@ -672,7 +675,7 @@ async def test_a_decorator_reporting_read_cannot_smuggle_a_write_tool_past_the_g
     # The bypass the `any(...)` in `writes()` exists for: `innermost().effect` would have been
     # enough for an honest stack, and this stack is not honest.
     liar = LyingDecorator(DeleteTool())
-    assert liar.effect is not None  # the outermost says READ
+    assert liar.effect is Effect.READ  # the outermost says READ
     with pytest.raises(ValueError, match="no permission gate"):
         loop(scripted(ModelResponse.of("x")), liar)
 
@@ -691,6 +694,29 @@ async def test_a_truthy_marker_does_not_pass_for_a_gate() -> None:
 
     with pytest.raises(ValueError, match="no permission gate"):
         loop(scripted(ModelResponse.of("x")), TruthyGate[EchoArgs](DeleteTool()))
+
+
+async def test_a_plain_string_effect_still_needs_a_gate() -> None:
+    # `Effect` is a StrEnum, so `is Effect.WRITE` would be False here and the tool would be
+    # accepted ungated -- a security check failing open. `writes()` uses `==` for this reason.
+    with pytest.raises(ValueError, match="no permission gate"):
+        # mypy --strict rejects this call too, which is the second defence; the ignore is here
+        # because the first defence -- the runtime check -- is what this test exists to pin.
+        loop(scripted(ModelResponse.of("x")), StringEffectTool())  # type: ignore[arg-type]
+
+
+async def test_a_write_tool_cannot_be_its_own_gate() -> None:
+    # It sets `gates_writes = True` on itself but wraps nothing; only a decorator can be a gate.
+    with pytest.raises(ValueError, match="no permission gate"):
+        loop(scripted(ModelResponse.of("x")), SelfApprovingWriteTool())
+
+
+async def test_the_tool_registry_cannot_be_added_to_after_construction() -> None:
+    # The gate check runs once, at construction; a tool inserted afterwards would have passed
+    # nothing on its way to the model.
+    built = loop(scripted(ModelResponse.of("x")), EchoTool())
+    with pytest.raises(TypeError):
+        built._tools["delete"] = DeleteTool()  # type: ignore[index]  # read-only on purpose
 
 
 async def test_a_read_tool_needs_no_gate() -> None:
@@ -725,7 +751,7 @@ async def test_a_stalled_observer_cannot_hang_a_run(monkeypatch: pytest.MonkeyPa
     assert staller.entered >= 2  # it was called for each event, and bounded each time
 
 
-async def test_a_stalled_observer_is_logged_without_its_event_payload(
+async def test_a_stalled_observer_is_logged_by_name(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr("agent_container.core.loop.OBSERVER_TIMEOUT_SECONDS", 0.01)
