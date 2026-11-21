@@ -297,6 +297,22 @@ class AgentLoop:
                         )
                     blocks: list[ToolResultBlock] = []
                     for call in response.tool_uses:
+                        # Check the WALL CLOCK between dispatches -- only that, not the whole
+                        # budget. `asyncio.timeout(0)` fires at the next yield, so a tool that
+                        # completes without awaiting anything runs after the clock has expired,
+                        # and one reply can carry many calls. Turns and tokens are deliberately
+                        # not checked here: the model already produced this reply within budget,
+                        # so its tool calls belong to a turn that was allowed, and stopping them
+                        # mid-batch would make `max_turns=1` mean "no tools at all".
+                        # Found by Codex on 2026-11-20.
+                        if run.budget.remaining_seconds <= 0.0:
+                            exceeded = BudgetExceeded(
+                                "wall_clock", run.budget.elapsed, run.budget.max_seconds
+                            )
+                            run.messages.append(Message("user", tuple(blocks)))
+                            return await self._finish(
+                                run, EndReason.BUDGET_EXCEEDED, exceeded.message, exceeded
+                            )
                         blocks.append(await self._run_tool(run, call))
                     run.messages.append(Message("user", tuple(blocks)))
                     stop = await self.should_stop(run.state())

@@ -603,3 +603,38 @@ def test_the_tool_name_pattern_rejects_a_trailing_newline() -> None:
     assert not _TOOL_NAME.match("echo\n")
     assert not _TOOL_NAME.match("a" * 64 + "\n")
     assert not _TOOL_NAME.match("a" * 65)
+
+
+async def test_no_tool_is_dispatched_once_the_wall_clock_has_expired() -> None:
+    """`asyncio.timeout(0)` only fires at the next yield.
+
+    A tool that completes without awaiting anything therefore runs to completion after the clock
+    has already expired, and one reply can carry many tool calls, so a whole batch would execute
+    past the limit. Found by Codex on 2026-11-20.
+    """
+    now = [0.0]
+    ran: list[str] = []
+
+    class Recording(EchoTool):
+        async def run(self, args: object, ctx: object) -> ToolResult:
+            ran.append("dispatched")
+            now[0] += 10.0  # this one tool eats the whole remaining clock
+            return ToolResult.ok("x")
+
+    # One reply, two tool calls. The clock is fine when the batch starts and expired after the
+    # first tool, so without a check between dispatches the second runs anyway.
+    provider = scripted(
+        ModelResponse(
+            content=(
+                ToolUseBlock("c1", "echo", {"text": "a"}),
+                ToolUseBlock("c2", "echo", {"text": "b"}),
+            ),
+            stop_reason="tool_use",
+        ),
+        ModelResponse.of("never reached"),
+    )
+    budget = Budget(max_seconds=5, clock=lambda: now[0])
+    result = await loop(provider, Recording()).run("go", budget)
+
+    assert result.end_reason is EndReason.BUDGET_EXCEEDED
+    assert len(ran) == 1, f"dispatched {len(ran)}; the second ran past the clock"
