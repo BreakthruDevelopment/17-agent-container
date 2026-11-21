@@ -32,6 +32,7 @@ from agent_container.core import (
     UnrecognizedStopReason,
     Usage,
 )
+from agent_container.core.loop import _TOOL_NAME
 from agent_container.core.messages import TextBlock
 from tests.support import DeleteTool, EchoTool, scripted, tool_call, use_tool
 
@@ -581,3 +582,15 @@ async def test_a_registered_tool_whose_name_breaks_the_allowlist_never_runs() ->
     block = last_tool_result(provider)
     assert block.is_error
     assert block.content.count("</tool_result") == 1
+
+
+def test_the_tool_name_pattern_rejects_a_trailing_newline() -> None:
+    """`$` matches before a trailing newline in Python; `\\Z` does not.
+
+    Without this the pattern accepted "echo\\n", so a name could carry a newline into a JSON log
+    line. Untested until round 4: reverting `\\Z` to `$` passed all 117 tests.
+    """
+    assert _TOOL_NAME.match("echo")
+    assert not _TOOL_NAME.match("echo\n")
+    assert not _TOOL_NAME.match("a" * 64 + "\n")
+    assert not _TOOL_NAME.match("a" * 65)

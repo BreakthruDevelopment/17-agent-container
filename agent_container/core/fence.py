@@ -35,6 +35,13 @@ def fence_tool_output(
     `MAX_TOOL_OUTPUT_CHARS` is cut and says so. The header attributes are written by the library,
     not the tool.
     """
+    if not nonce:
+        # An empty nonce renders `fence=`, which tool output can close exactly -- measured at two
+        # closing markers, i.e. no fence at all. It also makes `_strip_nonce` non-terminating,
+        # since `"" in value` is always true. Refuse at the top, before anything touches it:
+        # `fence_tool_output` is exported, so 17.3 and 17.4 reach it directly.
+        raise ValueError("a fence nonce is required")
+
     # Cap BEFORE stripping, not after. Stripping to a fixed point is O(passes x length) and the
     # caller chooses the pass count -- nesting N[0] + S + N[1:] needs one pass per layer -- so
     # stripping first lets a large input burn seconds of CPU to produce a short body. This is
@@ -67,8 +74,6 @@ def _strip_nonce(value: str, nonce: str) -> str:
     prompt -- so a tool it names can carry that payload into a result and re-form a genuine closing
     marker. Looping to a fixed point terminates, because each pass strictly shortens the string.
     """
-    if not nonce:  # `"" in value` is always true: the loop below would never end.
-        return value
     while nonce in value:
         value = value.replace(nonce, "")
     return value
@@ -84,8 +89,14 @@ def _attr(value: str, nonce: str) -> str:
     `x fence=NONCE>` ends the header, and everything after it reads as library text rather than as
     fenced data.
     """
+    # Cap first, then strip -- the same order as the body, and for the same reason. Stripping is
+    # O(passes x length) with the caller choosing the passes, and `tool_use_id` arrives straight
+    # from the model with no length bound of its own, so stripping a megabyte here burns seconds
+    # of CPU on the event loop. Measured before this change: a 320,016-character id took 1.53s
+    # against 0.0001s for the same payload in the body. The slack of len(nonce) keeps a marker
+    # from surviving by straddling the cut.
     cleaned = (
-        _strip_nonce(value, nonce)
+        _strip_nonce(value[: MAX_ATTR_CHARS + len(nonce)], nonce)
         .replace("<", "")
         .replace(">", "")
         .replace('"', "'")

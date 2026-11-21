@@ -160,10 +160,32 @@ def test_stripping_is_bounded_by_the_cap_not_by_the_input() -> None:
     assert out.count(f"</tool_result fence={nonce}>") == 1
 
 
-def test_an_empty_nonce_does_not_hang() -> None:
-    """`"" in value` is always true, so a naive fixed point never ends.
+def test_an_empty_nonce_is_refused() -> None:
+    """Fail fast and loud, not merely terminate.
 
-    `fence_tool_output` is exported, so 17.3 and 17.4 can call it directly; the loop only avoids
-    this by the accident of a falsy nonce never being generated.
+    An earlier version returned a fence marked `fence=`, which tool output closes exactly -- two
+    closing markers, so no fence at all. The test then asserted only truthiness and passed with
+    the fence wide open. `fence_tool_output` is exported, so 17.3 and 17.4 reach it directly.
     """
-    assert fence_tool_output(tool="ok", tool_use_id="t1", content="body", nonce="")
+    with pytest.raises(ValueError, match="nonce"):
+        fence_tool_output(tool="ok", tool_use_id="t1", content="body", nonce="")
+
+
+def test_an_unbounded_attribute_cannot_burn_cpu() -> None:
+    """`tool_use_id` comes straight from the model and has no length bound of its own.
+
+    The body was reordered to cap before stripping; the attributes were not, so the same quadratic
+    cost was reachable through the id. Measured before the fix: 320,016 characters took 1.53s
+    against 0.0001s for the same payload in the body, starving the event loop app 20 runs on.
+    """
+    import time
+
+    nonce = "deadbeefcafe0123"
+    payload = nonce
+    for _ in range(20_000):
+        payload = nonce[0] + payload + nonce[1:]
+
+    started = time.perf_counter()
+    out = fence_tool_output(tool="ok", tool_use_id=payload, content="b", nonce=nonce)
+    assert time.perf_counter() - started < 1.0
+    assert out.count(f"</tool_result fence={nonce}>") == 1
