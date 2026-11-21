@@ -43,9 +43,16 @@ from agent_container.core.tool import (
     StagedChange,
     ToolContext,
     ToolResult,
+    has_write_gate,
+    writes,
 )
 
 MAX_USER_MESSAGE_CHARS = 8_000
+
+# How long one observer may take per event. Telemetry is the expected observer and a stalled
+# exporter must not hold a run open, so this is a ceiling on reporting, not on work: exceeding it
+# is logged and the run carries on, exactly as an observer that raises already did.
+OBSERVER_TIMEOUT_SECONDS = 5.0
 
 # A tool name is an identifier. The same shape the provider contract enforces, applied at the
 # boundary so a model-chosen name never reaches a fenced result, a header or a log line.
@@ -291,6 +298,15 @@ class AgentLoop(metaclass=_LoopMeta):
         for tool in tools:
             if tool.name in by_name:
                 raise ValueError(f"two tools are named {tool.name!r}")
+            # `AGENTS.md`: an `effect: write` tool without a `PermissionGate` anywhere in its stack
+            # is a construction error. Enforced here, the one place every tool must pass through,
+            # rather than at dispatch -- by then the tool is already in the model's tool list, and
+            # a caller that built the loop has been told nothing is wrong.
+            if writes(tool) and not has_write_gate(tool):
+                raise ValueError(
+                    f"tool {tool.name!r} writes but has no permission gate in its stack; "
+                    "wrap it in a gate (17.4's PermissionGate) before giving it to a loop"
+                )
             by_name[tool.name] = tool
         self._provider = provider
         self._tools = by_name
@@ -544,7 +560,20 @@ class AgentLoop(metaclass=_LoopMeta):
         event = LoopEvent(kind, run.run_id, run.turn, tool, detail, input_tokens, output_tokens)
         for observer in self._observers:
             try:
-                await observer.on_event(event)
+                # Bounded, and not by the run budget. An observer must not be able to hang a run:
+                # the budget's own timeouts wrap the model call and each tool, and publishing
+                # happens *outside* them, so an unbounded `on_event` would outlive the budget it
+                # is reporting on -- including the final BUDGET_EXCEEDED event, and the publish
+                # that follows an `end_turn` response, which would strand a finished answer.
+                async with asyncio.timeout(OBSERVER_TIMEOUT_SECONDS):
+                    await observer.on_event(event)
+            except TimeoutError:
+                _log.warning(
+                    "observer %s timed out after %ss on %s",
+                    type(observer).__name__,
+                    OBSERVER_TIMEOUT_SECONDS,
+                    kind,
+                )
             except Exception as exc:
                 _log.warning(
                     "observer %s failed on %s: %s",

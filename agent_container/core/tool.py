@@ -213,3 +213,37 @@ def innermost(tool: AnyTool) -> AnyTool:
     """The leaf tool at the bottom of a decorator stack."""
     *_, leaf = walk_stack(tool)
     return leaf
+
+
+# The gate contract. `AGENTS.md` makes it a *construction* error for an `effect: write` tool to
+# reach a loop without a `PermissionGate` anywhere in its stack, and construction lives in 17.2
+# while the gate itself is 17.4's. So the core defines what a gate must advertise -- the same split
+# as `StagedChange` above -- and 17.2 enforces it. 17.4's `PermissionGate` sets `gates_writes`.
+GATE_MARKER = "gates_writes"
+
+
+class WriteGate(Protocol):
+    """What a permission gate advertises. 17.4's `PermissionGate` satisfies this."""
+
+    @property
+    def gates_writes(self) -> bool: ...
+
+
+def writes(tool: AnyTool) -> bool:
+    """Whether anything in this stack claims to write.
+
+    Deliberately `any`, not `innermost(...).effect`: a decorator that reported `READ` over a write
+    leaf would otherwise slip a write tool past the gate check. A stack is a write stack if any
+    member says so.
+    """
+    return any(member.effect is Effect.WRITE for member in walk_stack(tool))
+
+
+def has_write_gate(tool: AnyTool) -> bool:
+    """Whether some member of this stack advertises itself as a permission gate.
+
+    Read by attribute rather than `isinstance`: a `runtime_checkable` Protocol with a non-method
+    member cannot be used with `isinstance`, and importing 17.4's concrete gate here would invert
+    the dependency. `is True` so a truthy stub cannot pass for a gate.
+    """
+    return any(getattr(member, GATE_MARKER, False) is True for member in walk_stack(tool))

@@ -84,6 +84,43 @@ class PassThrough[A: BaseModel](Tool[A]):
         return await self._inner.run(args, ctx)
 
 
+class FakeGate[A: BaseModel](PassThrough[A]):
+    """A stand-in for 17.4's `PermissionGate`: it only advertises the marker.
+
+    17.2 owns the construction-time check, not the gate, so the tests need something that
+    satisfies the contract without 17.4 existing. It stages nothing and approves nothing -- when
+    `PermissionGate` lands, these tests should keep passing against the real one.
+    """
+
+    gates_writes = True
+
+
+class LyingDecorator[A: BaseModel](PassThrough[A]):
+    """Reports `READ` over whatever it wraps: the bypass the gate check must not allow."""
+
+    @property
+    def effect(self) -> Effect:
+        return Effect.READ
+
+
+class WriteClaimingDecorator[A: BaseModel](PassThrough[A]):
+    """Reports `WRITE` over a read-only leaf -- a wrapper that writes something of its own.
+
+    This is the stack that makes `writes()` need `any(...)`: the leaf is honest and read-only, so
+    `innermost(...).effect` would call the whole stack a read and let it past the gate check.
+    """
+
+    @property
+    def effect(self) -> Effect:
+        return Effect.WRITE
+
+
+class TruthyGate[A: BaseModel](PassThrough[A]):
+    """Advertises the marker with a truthy non-`True` value: must not pass for a gate."""
+
+    gates_writes = "yes"  # not `True`: wrong on purpose
+
+
 def tool_call(text: str = "hi", *, id: str = "call-1", name: str = "echo") -> ToolUseBlock:
     return ToolUseBlock(id, name, {"text": text})
 
