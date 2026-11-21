@@ -257,6 +257,11 @@ def has_write_gate(tool: AnyTool) -> bool:
     never does. This catches the accidental case and nothing more: an author set on evading it can
     return a throwaway tool from `wrapped`, or more cheaply just declare `Effect.READ`, which no
     check here has ever claimed to catch. The gate check guards mistakes, not the tool's author.
+
+    The question it answers is "is a gate somewhere in this stack", not "is every write gated". A
+    decorator that declares `Effect.WRITE`, performs writes of its own, and holds a gated stack
+    beneath that it never calls satisfies it. That is the same evasion, and `Cached` relies on this
+    check, so a decorator that writes must delegate to what it wraps.
     """
     return any(
         getattr(member, GATE_MARKER, False) is True and member.wrapped is not None

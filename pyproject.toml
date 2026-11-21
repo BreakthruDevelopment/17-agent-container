@@ -17,6 +17,7 @@ dev = [
     "mypy>=1.13",
     "pytest>=8.3",
     "pytest-asyncio>=1.0",
+    "pytest-timeout>=2.4.0",
     "ruff>=0.8",
 ]
 
@@ -53,5 +54,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers --strict-config"
+# A hung test fails after 60 s instead of stalling the run (no test here legitimately takes that long).
+timeout = 60
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
