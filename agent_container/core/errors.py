@@ -35,3 +35,7 @@ class ReplayExhausted(AgentContainerError, RuntimeError):
 
 class ReplayFormatError(AgentContainerError, ValueError):
     """A replay fixture is not in the recorded-reply format."""
+
+
+class StagedChangeError(AgentContainerError, RuntimeError):
+    """A staged change could not be applied: it was applied before, or the tool failed."""
