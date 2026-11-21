@@ -100,20 +100,44 @@ def load_manifest(text: str) -> Manifest:
     `system_prompt`, a credential pasted into one. Reading `.line`/`.column` off the mark
     instead of stringifying it sidesteps the snippet.
 
-    `problem` is safe for VALUES, which is what the promise covers, not for every byte of the
-    document: three of PyYAML's problem strings repeat a YAML identifier -- `duplicate tag
-    handle %r`, `found undefined alias %r`, `could not determine a constructor for the tag %r`.
-    Those are structural tokens, never a scalar value. The one message that does echo a value,
-    `expected the empty value, but found %r`, lives in `FullConstructor` and is unreachable
-    from `safe_load`.
+    `problem` is safe for whole VALUES, which is what the promise covers, not for every byte of
+    the document: several of PyYAML's problem strings repeat a YAML identifier -- `duplicate tag
+    handle %r`, `found undefined alias %r`, `found undefined tag handle %r`, `could not
+    determine a constructor for the tag %r`. Those are structural tokens. The scanner can also
+    echo a single character from inside a quoted scalar (`expected escape sequence of 2
+    hexadecimal numbers, but found 'S'`), which is a character, not a value. The one message
+    that echoes a whole value, `expected the empty value, but found %r`, lives in
+    `FullConstructor` and cannot be reached from `safe_load`. Reading only `.problem` also keeps
+    `found duplicate anchor %r` out, since that lands in `.context`.
+
+    And `safe_load` does not raise only `YAMLError`. `SafeConstructor`'s scalar conversions
+    raise plain builtins with the value interpolated -- `!!int SECRET` gives `ValueError:
+    invalid literal for int() with base 10: 'SECRET'`, `!!bool` a `KeyError`, `!!timestamp` an
+    `AttributeError` -- so catching `YAMLError` alone let exactly the opening case through. The
+    second handler catches those, names only the exception type, and suppresses the cause so the
+    value cannot resurface in a traceback.
     """
+    # Both messages are built inside the handlers and raised OUTSIDE them. Raising in place
+    # keeps the original as `__context__` even with `from None`, and the original is the thing
+    # that carries the value -- a snippet for a YAMLError, the scalar itself for a builtin. PR
+    # #12 found the same shape in `ToolCallChange.apply()`: redacted message, secret in the
+    # chain. `__suppress_context__` alone would hide it from the default traceback while
+    # leaving it readable on the object.
+    failure: str | None = None
+    loaded: object = None
     try:
-        loaded: object = yaml.safe_load(text)
+        loaded = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         problem = getattr(exc, "problem", None) or "could not be parsed"
         mark = getattr(exc, "problem_mark", None)
         where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
-        raise ManifestError(f"manifest is not valid YAML: {problem}{where}") from exc
+        failure = f"{problem}{where}"
+    except Exception as exc:
+        # `SafeConstructor`'s scalar conversions raise plain builtins with the value in the
+        # message, so `except YAMLError` alone let the opening case straight through.
+        failure = f"a tagged scalar could not be converted ({type(exc).__name__})"
+    if failure is not None:
+        raise ManifestError(f"manifest is not valid YAML: {failure}")
     if loaded is None:
         raise ManifestError("manifest is empty")
     if not isinstance(loaded, dict):

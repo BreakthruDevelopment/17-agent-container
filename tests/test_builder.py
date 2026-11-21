@@ -383,3 +383,33 @@ def test_a_yaml_syntax_error_does_not_echo_the_manifest() -> None:
     message = str(caught.value)
     assert marker not in message, f"manifest text leaked into the error: {message!r}"
     assert "line" in message and "column" in message, message
+    # The chain too: a YAMLError stringifies to a snippet of the document.
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "system_prompt: !!int {marker}",
+        "system_prompt: !!float {marker}",
+        "system_prompt: !!bool {marker}",
+        "system_prompt: !!timestamp {marker}",
+    ],
+)
+def test_a_tagged_scalar_does_not_echo_the_manifest(document: str) -> None:
+    """`safe_load` does not raise only `YAMLError`.
+
+    `SafeConstructor`'s scalar conversions raise plain builtins with the value interpolated,
+    so catching `YAMLError` alone let the exact case the docstring opens with straight through:
+    a `system_prompt` with a credential in it, returned in a `ValueError`.
+    """
+    marker = "MARKER-do-not-echo-abc123"
+    with pytest.raises(ManifestError) as caught:
+        load_manifest(document.format(marker=marker) + "\n")
+    message = str(caught.value)
+    assert marker not in message, f"manifest text leaked: {message!r}"
+    assert marker.lower() not in message.lower(), f"manifest text leaked: {message!r}"
+    # The cause is suppressed too, or the value returns in the traceback (PR #12's finding).
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None or marker not in str(caught.value.__context__)
