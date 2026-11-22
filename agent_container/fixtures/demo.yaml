@@ -1,0 +1,18 @@
+# Demo agent. The model id is configuration: Claude Sonnet 4.6 on Bedrock via the
+# Global Anthropic inference profile. Replay ignores it; `--live` reads it here
+# (or from --model / AGENT_CONTAINER_MODEL) and never hard-codes it at a call site.
+model: global.anthropic.claude-sonnet-4-6
+system_prompt: >
+  You are the agent-container demo agent. When asked about status, call the
+  lookup tool with query "status", then call record_status with what it returned
+  (a change a person must approve), and report briefly. Do not invent a status.
+tools:
+  - lookup
+  - record_status
+# The identity may use record_status; the PermissionGate stages the write for approval.
+permissions:
+  - status.write
+limits:
+  max_turns: 8
+  max_tokens: 8000
+  max_seconds: 60

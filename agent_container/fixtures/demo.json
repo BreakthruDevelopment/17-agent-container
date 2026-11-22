@@ -1,7 +1,47 @@
 {
-  "description": "Recorded replies for the demo. Hand-written stub until the recorder (slice 17.3) exists.",
+  "description": "Four-turn demo: lookup fails with a retryable transient error (Retrying retries then reports it), the model calls lookup again and it succeeds, calls record_status (a write, staged by the PermissionGate for approval), then end_turn. No secrets.",
   "replies": [
-    {"stop_reason": "tool_use", "text": "Looking that up."},
-    {"stop_reason": "end_turn", "text": "Done."}
+    {
+      "stop_reason": "tool_use",
+      "text": "Looking that up.",
+      "tool_uses": [
+        {
+          "id": "tooluse_demo_lookup_1",
+          "name": "lookup",
+          "input": {"query": "status"}
+        }
+      ],
+      "usage": {"input_tokens": 128, "output_tokens": 24}
+    },
+    {
+      "stop_reason": "tool_use",
+      "text": "Retrying the lookup.",
+      "tool_uses": [
+        {
+          "id": "tooluse_demo_lookup_2",
+          "name": "lookup",
+          "input": {"query": "status"}
+        }
+      ],
+      "usage": {"input_tokens": 176, "output_tokens": 20}
+    },
+    {
+      "stop_reason": "tool_use",
+      "text": "Recording the status.",
+      "tool_uses": [
+        {
+          "id": "tooluse_demo_record_1",
+          "name": "record_status",
+          "input": {"status": "ok"}
+        }
+      ],
+      "usage": {"input_tokens": 230, "output_tokens": 22}
+    },
+    {
+      "stop_reason": "end_turn",
+      "text": "Status is ok; recording it is staged for approval.",
+      "tool_uses": [],
+      "usage": {"input_tokens": 280, "output_tokens": 16}
+    }
   ]
 }
