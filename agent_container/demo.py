@@ -133,6 +133,22 @@ class RecordStatusTool(Tool[RecordStatusArgs]):
         return ToolResult.ok(f"recorded status: {args.status}")
 
 
+def _run_succeeded(result: RunResult) -> bool:
+    """Whether the run finished on its own rather than on a limit or a fault.
+
+    One predicate, shared by `DemoOutcome.succeeded` and by the gate that decides whether to
+    apply staged writes. They were separate and the apply ran unconditionally, so a truncated
+    run printed `approved: record_status: ...` and then `demo failed`, having already written.
+    If the two drift apart that defect comes straight back.
+
+    `==`, not `is`: `EndReason` is a `StrEnum`, and an equal plain string is a different object.
+    This field is set by the loop and never read off the wire, so `is` happened to work here --
+    but `17-agent-container#11` is the same comparison in `ToolResult.failure`, where the value
+    DOES come from the wire and `is` silently returns the wrong answer.
+    """
+    return result.end_reason == EndReason.END_TURN
+
+
 @dataclass(frozen=True, slots=True)
 class DemoOutcome:
     """What a demo run produced: the loop's result, each stop reason, and the approved writes."""
@@ -144,7 +160,7 @@ class DemoOutcome:
     @property
     def succeeded(self) -> bool:
         """The run ended because the model finished, not because a limit or a fault stopped it."""
-        return self.result.end_reason is EndReason.END_TURN
+        return _run_succeeded(self.result)
 
 
 class _StopReasons:
@@ -230,9 +246,12 @@ async def execute_demo(
     loop = builder.with_observer(reasons).build()
     result = await loop.run(options.message, builder.budget())
     approved: list[str] = []
-    for change in result.staged_changes:
-        await change.apply()
-        approved.append(change.description)
+    # Apply staged writes ONLY when the run actually succeeded. A staged change exists so that a
+    # person decides; a run that ended on a limit or a fault is not an approval.
+    if _run_succeeded(result):
+        for change in result.staged_changes:
+            await change.apply()
+            approved.append(change.description)
     return DemoOutcome(result, tuple(reasons.reasons), tuple(approved))
 
 

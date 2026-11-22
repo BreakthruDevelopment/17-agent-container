@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -125,3 +128,43 @@ async def test_without_the_permission_the_gate_refuses_and_nothing_is_staged() -
 
 def test_the_manifest_grants_the_write_permission() -> None:
     assert WRITE_PERMISSION in demo_manifest_text()
+
+
+async def test_a_failed_run_stages_the_write_but_never_applies_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run that ended on a limit is not an approval.
+
+    The apply loop used to run unconditionally, before anything looked at `end_reason`. With a
+    truncated run the demo printed `approved: record_status: ... {"status":"ok"}` and then
+    `demo failed: the run ended with end_reason=truncated`, exit 1 -- having already written.
+    """
+    ran: list[RecordStatusTool] = []
+    original = RecordStatusTool.__init__
+
+    def spy(self: RecordStatusTool) -> None:
+        original(self)
+        ran.append(self)
+
+    monkeypatch.setattr(RecordStatusTool, "__init__", spy)
+    replies = load_demo_replies()
+    truncated = [*replies[:-1], replace(replies[-1], stop_reason="max_tokens")]
+    outcome = await execute_demo(DemoOptions(), provider=ReplayProvider(truncated), log_stream=None)
+
+    assert not outcome.succeeded
+    assert outcome.result.end_reason is EndReason.TRUNCATED
+    # The gate still staged it -- the write was authorised, it simply must not be applied.
+    assert len(outcome.result.staged_changes) == 1
+    assert outcome.approved == ()
+    (tool,) = ran
+    assert tool.recorded == [], "a failed run applied its staged write"
+
+
+def test_the_apply_gate_and_succeeded_share_one_predicate() -> None:
+    """They were separate once, and the apply ran unconditionally. Drift reintroduces the bug."""
+    source = Path("agent_container/demo.py").read_text()
+    body = source.split("async def execute_demo")[1]
+    assert "_run_succeeded(result)" in body, "the apply gate no longer uses the shared predicate"
+    assert body.count("end_reason ==") == 0 and body.count("end_reason is") == 0, (
+        "execute_demo compares end_reason directly instead of using _run_succeeded"
+    )
