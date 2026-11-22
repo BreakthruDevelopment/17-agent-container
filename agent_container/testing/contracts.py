@@ -284,6 +284,13 @@ class StagedCase:
     rewritten_value: str
     """The argument as the applied call receives it -- must not appear in `description`."""
 
+    recomposed: Callable[[], str]
+    """What the record *would* read if it were rendered now, from the arguments as they stand
+    after `apply()`. The suite asserts this differs from the staged record: without it the four
+    substring relations above can all hold while the rewritten argument is one the record never
+    displays, in which case a live description would not have moved either and the freeze test
+    passes on a change that is not frozen."""
+
 
 class StagedChangeContract(ABC):
     """What every `StagedChange` must do: hold still.
@@ -306,10 +313,20 @@ class StagedChangeContract(ABC):
       than the scalar, so the substring never matched; and a tool description long enough that
       `limit_description` truncated the arguments off the end, so the check was trivially true.
 
-    So both values are now pinned from both sides. To satisfy the suite a case must have a value
-    the record reports and the applied call did not receive, *and* a value the applied call
-    received and the record does not report -- which is what "the hook rewrote the argument the
-    record describes" actually means.
+    So both values are pinned from both sides: a case must have a value the record reports and the
+    applied call did not receive, *and* a value the applied call received and the record does not
+    report. Those four relations are still only facts about two strings, and a third version of
+    this suite overstated them -- nothing in them ties the two values to the **same** argument, so
+    a case that rewrote a field the record never displays satisfied all four while a provably live
+    description went green. `recomposed` closes that: the suite renders the record from the
+    arguments as they stand after `apply()` and requires it to differ from the staged record, so
+    the rewrite must be one a live description would have shown.
+
+    What remains on trust, irreducibly: `applied` and `recomposed` are the subclass's own
+    observations of its own implementation. A subclass that fabricates either -- a probe returning
+    a value no call produced, a renderer returning a string it never renders -- can still pass.
+    The suite checks that they are consistent with each other and with the record; it cannot check
+    that they are honest. Write them as thin views over real state, not as literals.
     """
 
     @abstractmethod
@@ -360,6 +377,16 @@ class StagedChangeContract(ABC):
             case.approved_value not in applied_repr,
             f"the applied call received {applied_repr!r}, which still carries the approved value "
             f"{case.approved_value!r}: nothing rewrote the argument, so this test proves nothing",
+        )
+
+        # The rewrite must be one the record would have shown. Otherwise a live description would
+        # read the same as a frozen one and the assertion below proves nothing.
+        would_read_now = case.recomposed()
+        _require(
+            would_read_now != shown_at_approval,
+            f"rendering the record from the arguments as they now stand gives {would_read_now!r}, "
+            f"the same text as the staged record: the applied call rewrote something the record "
+            "never displays, so this test cannot tell a frozen description from a live one",
         )
 
         _require(

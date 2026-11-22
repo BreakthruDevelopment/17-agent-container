@@ -30,7 +30,7 @@ from agent_container.core import (
     ToolUseBlock,
     Usage,
 )
-from agent_container.core.decorators import MAX_DESCRIPTION_CHARS
+from agent_container.core.decorators import MAX_DESCRIPTION_CHARS, limit_description
 from agent_container.testing import OverlapProbe
 
 
@@ -337,3 +337,17 @@ def staged_pay_behind_a_clamp(
     change = result.staged
     assert change is not None, "the gate did not stage the write"
     return change, pay
+
+
+def pay_record_as_it_would_read(
+    pay: ClampingPay, redact: Callable[[str], str] | None = None
+) -> str:
+    """Render the staged record from the `pay` arguments as they now stand.
+
+    A thin view over real state, which is what `StagedCase.recomposed` must be: it reads the very
+    model object the applied call received -- the same object the gate snapshotted, which is why
+    the defect existed -- and renders it exactly as `ToolCallChange` would.
+    """
+    args = pay.received[-1] if pay.received else ClampArgs()
+    full = f"{pay.name}: {pay.description} (arguments: {args.model_dump_json()})"
+    return limit_description(redact(full) if redact else full)

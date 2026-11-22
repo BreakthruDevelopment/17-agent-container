@@ -24,6 +24,7 @@ from tests.support import (
     EchoTool,
     PassThrough,
     ProbedReplay,
+    pay_record_as_it_would_read,
     staged_pay_behind_a_clamp,
 )
 
@@ -64,7 +65,13 @@ class TestToolCallChangeContract(StagedChangeContract):
 
     def make_change(self) -> StagedCase:
         change, pay = staged_pay_behind_a_clamp()
-        return StagedCase(change, lambda: pay.paid, approved_value="5000", rewritten_value="100")
+        return StagedCase(
+            change,
+            lambda: pay.paid,
+            approved_value="5000",
+            rewritten_value="100",
+            recomposed=lambda: pay_record_as_it_would_read(pay),
+        )
 
 
 class TestRedactedStagedContract(StagedChangeContract):
@@ -81,6 +88,7 @@ class TestRedactedStagedContract(StagedChangeContract):
             lambda: pay.paid,
             approved_value="5000",
             rewritten_value="100",
+            recomposed=lambda: pay_record_as_it_would_read(pay, redacting.redact),
         )
 
 
@@ -121,7 +129,14 @@ class _ThawedCase(StagedChangeContract):
     """Reports no applied call, because there is none."""
 
     def make_change(self) -> StagedCase:
-        return StagedCase(_Thawed(), lambda: [], approved_value="5000", rewritten_value="100")
+        thawed = _Thawed()
+        return StagedCase(
+            thawed,
+            lambda: [],
+            approved_value="5000",
+            rewritten_value="100",
+            recomposed=lambda: thawed.description,
+        )
 
 
 class _UnrewrittenCase(StagedChangeContract):
@@ -129,7 +144,13 @@ class _UnrewrittenCase(StagedChangeContract):
 
     def make_change(self) -> StagedCase:
         change, pay = staged_pay_behind_a_clamp(amount=5000, clamp_to=5000)
-        return StagedCase(change, lambda: pay.paid, approved_value="5000", rewritten_value="100")
+        return StagedCase(
+            change,
+            lambda: pay.paid,
+            approved_value="5000",
+            rewritten_value="100",
+            recomposed=lambda: pay_record_as_it_would_read(pay),
+        )
 
 
 class _ModelProbeCase(StagedChangeContract):
@@ -144,7 +165,11 @@ class _ModelProbeCase(StagedChangeContract):
     def make_change(self) -> StagedCase:
         change, pay = staged_pay_behind_a_clamp(amount=5000, clamp_to=5000)
         return StagedCase(
-            change, lambda: list(pay.received), approved_value="5000", rewritten_value="100"
+            change,
+            lambda: list(pay.received),
+            approved_value="5000",
+            rewritten_value="100",
+            recomposed=lambda: pay_record_as_it_would_read(pay),
         )
 
 
@@ -158,7 +183,13 @@ class _TruncatedCase(StagedChangeContract):
 
     def make_change(self) -> StagedCase:
         change, pay = staged_pay_behind_a_clamp(long_description=True)
-        return StagedCase(change, lambda: pay.paid, approved_value="5000", rewritten_value="100")
+        return StagedCase(
+            change,
+            lambda: pay.paid,
+            approved_value="5000",
+            rewritten_value="100",
+            recomposed=lambda: pay_record_as_it_would_read(pay),
+        )
 
 
 def test_the_contract_rejects_a_change_whose_apply_reaches_nothing() -> None:
@@ -185,3 +216,59 @@ def test_the_contract_rejects_a_probe_too_coarse_to_show_the_rewrite() -> None:
 def test_the_contract_rejects_a_description_that_truncated_the_arguments_away() -> None:
     with pytest.raises(AssertionError, match="does not report the approved value"):
         _TruncatedCase().test_applying_does_not_rewrite_the_approval_record()
+
+
+class _InvisibleFieldArgs(BaseModel):
+    shown: int = 5000
+    hidden: str = "aaa"
+
+
+class _InvisibleFieldChange(StagedChange):
+    """Round 3's witness: the applied call rewrites a field the record never displays.
+
+    The description is recomposed live, so this is not frozen -- `thaw()` moves it. But the
+    rewritten field is absent from the rendered record, so all four substring relations hold with
+    honest values, and the freeze assertion passed because a live description had nothing to
+    show. Reachable for real: a `Field(exclude=True)` argument does this through the actual gate,
+    and an approval prompt that renders a human summary rather than full JSON makes most
+    arguments invisible -- at which point the suite's own constraints push the author towards
+    exactly this configuration.
+    """
+
+    def __init__(self) -> None:
+        self.args = _InvisibleFieldArgs()
+        self.received: list[str] = []
+
+    @property
+    def description(self) -> str:
+        return f'pay: Pay a supplier. (arguments: {{"shown":{self.args.shown}}})'
+
+    async def apply(self) -> None:
+        self.args.hidden = "zzz"
+        self.received.append(self.args.hidden)
+
+    def thaw(self) -> None:
+        self.args.shown = 100
+
+
+class _InvisibleFieldCase(StagedChangeContract):
+    def make_change(self) -> StagedCase:
+        change = _InvisibleFieldChange()
+        return StagedCase(
+            change,
+            lambda: change.received,
+            approved_value="5000",
+            rewritten_value="zzz",
+            recomposed=lambda: change.description,
+        )
+
+
+def test_the_contract_rejects_a_rewrite_the_record_never_displays() -> None:
+    """The four substring relations all hold here, with honest values. Only `recomposed` sees it."""
+    change = _InvisibleFieldChange()
+    before = change.description
+    change.thaw()
+    assert change.description != before, "this witness is supposed to be unfrozen"
+
+    with pytest.raises(AssertionError, match="never displays"):
+        _InvisibleFieldCase().test_applying_does_not_rewrite_the_approval_record()
