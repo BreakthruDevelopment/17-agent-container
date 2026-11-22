@@ -50,10 +50,10 @@ def test_a_recording_round_trips() -> None:
     assert parse_replies(data) == replies
 
 
-def test_the_scaffolding_fixture_still_loads() -> None:
+def test_the_demo_fixture_loads() -> None:
     path = Path(__file__).parent.parent / "agent_container" / "fixtures" / "demo.json"
     provider = ReplayProvider.from_file(path)
-    assert provider.remaining == 2
+    assert provider.remaining == 3
 
 
 def test_an_unrecognized_stop_reason_is_carried_through_for_the_loop_to_reject() -> None:

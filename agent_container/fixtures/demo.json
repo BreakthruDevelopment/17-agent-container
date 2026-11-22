@@ -1,7 +1,35 @@
 {
-  "description": "Recorded replies for the demo. Hand-written stub until the recorder (slice 17.3) exists.",
+  "description": "Three-turn demo: lookup fails with a retryable transient error (Retrying retries then reports it), the model calls lookup again and it succeeds, then end_turn. No secrets.",
   "replies": [
-    {"stop_reason": "tool_use", "text": "Looking that up."},
-    {"stop_reason": "end_turn", "text": "Done."}
+    {
+      "stop_reason": "tool_use",
+      "text": "Looking that up.",
+      "tool_uses": [
+        {
+          "id": "tooluse_demo_lookup_1",
+          "name": "lookup",
+          "input": {"query": "status"}
+        }
+      ],
+      "usage": {"input_tokens": 128, "output_tokens": 24}
+    },
+    {
+      "stop_reason": "tool_use",
+      "text": "Retrying the lookup.",
+      "tool_uses": [
+        {
+          "id": "tooluse_demo_lookup_2",
+          "name": "lookup",
+          "input": {"query": "status"}
+        }
+      ],
+      "usage": {"input_tokens": 176, "output_tokens": 20}
+    },
+    {
+      "stop_reason": "end_turn",
+      "text": "Status is ok.",
+      "tool_uses": [],
+      "usage": {"input_tokens": 220, "output_tokens": 12}
+    }
   ]
 }
