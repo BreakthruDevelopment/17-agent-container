@@ -42,17 +42,21 @@ jobs:
           uv build
           uv venv --python 3.12 /tmp/wheel-check
           uv pip install --python /tmp/wheel-check/bin/python dist/*.whl
-          /tmp/wheel-check/bin/python -c "import agent_container, agent_container.core"
+          # -P: without it `python -c` puts the checkout root on sys.path and this imports the
+          # SOURCE tree, so it passes whatever the wheel contains. Measured: a gutted wheel passed.
+          /tmp/wheel-check/bin/python -P -c "import agent_container, agent_container.core"
       - name: Smoke test (CLI on recorded replies)
         run: |
           # Data on stdout (JSON-lines events), prose on stderr. The exit code is the CLI's own verdict.
           /tmp/wheel-check/bin/agent-container demo > smoke.events 2> smoke.out
           cat smoke.out
-          grep -q "stop_reason=end_turn" smoke.out
-          grep -q "staged_changes=1" smoke.out
-          grep -q "demo ok" smoke.out
+          # Anchored: the summary now includes the model's final answer (indented), and an
+          # unanchored match would let model text forge any of these three.
+          grep -qE "^turn [0-9]+: stop_reason=end_turn$" smoke.out
+          grep -qE "^staged_changes=1$" smoke.out
+          grep -qE "^demo ok" smoke.out
           # Every stdout line parses and the events are really there: a dead event bus fails here.
-          /tmp/wheel-check/bin/python -c "from agent_container.demo import validate_event_stream; validate_event_stream(open('smoke.events').read())"
+          /tmp/wheel-check/bin/python -P -c "from agent_container.demo import validate_event_stream; validate_event_stream(open('smoke.events').read())"
 
   image:
     name: Container image
@@ -72,4 +76,4 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Run the demo in the image
-        run: docker run --rm agent-container:ci demo 2>&1 >/dev/null | grep -q "demo ok"
+        run: docker run --rm agent-container:ci demo 2>&1 >/dev/null | grep -qE "^demo ok"

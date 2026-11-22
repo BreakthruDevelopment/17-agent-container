@@ -259,12 +259,23 @@ def print_run(outcome: DemoOutcome, *, live: bool, stream: TextIO | None = None)
     """The human summary, on stderr. Stdout is reserved for the JSON-lines event stream.
 
     `demo ok` is printed only when the run succeeded; the CLI's exit code says the same.
+
+    The model's final answer is part of the summary: without it `demo --live --message ...`
+    reports metrics and stop reasons and never shows what the agent actually said.
     """
     out = sys.stderr if stream is None else stream
     result = outcome.result
     reasons = list(outcome.stop_reasons) or ([result.stop_reason] if result.stop_reason else [])
     for turn, reason in enumerate(reasons, start=1):
         print(f"turn {turn}: stop_reason={reason}", file=out)
+    if result.final_text.strip():
+        # The model's own words, indented under a header. Indented because every other line of
+        # this summary is a fixed prefix at column 0 that CI greps for (`^demo ok`,
+        # `^staged_changes=1`): model text printed flush left could forge one and make a failed
+        # run look green. Tool results are data, and so is the final answer.
+        print("answer:", file=out)
+        for line in result.final_text.splitlines():
+            print(f"  {line}", file=out)
     print(f"end_reason={result.end_reason}", file=out)
     print(f"turns_used={result.turns_used}", file=out)
     print(f"tokens_in={result.input_tokens} tokens_out={result.output_tokens}", file=out)

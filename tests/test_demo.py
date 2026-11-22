@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import io
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from pydantic import ValidationError
 from agent_container.core import (
     EndReason,
     ErrorCategory,
+    ModelResponse,
     RateLimitedProvider,
     ReplayProvider,
     ToolContext,
@@ -30,6 +33,7 @@ from agent_container.demo import (
     load_demo_replies,
     lookup_stack,
     make_provider,
+    print_run,
 )
 
 
@@ -189,3 +193,79 @@ def test_the_apply_gate_and_succeeded_share_one_predicate() -> None:
                 f"execute_demo compares end_reason directly ({' '.join(rendered)}) "
                 "instead of using _run_succeeded"
             )
+
+
+async def test_the_summary_shows_the_models_answer() -> None:
+    """`print_run` reported metrics and stop reasons but never `result.final_text`.
+
+    So `agent-container demo --live --message ...` told the caller how many tokens it spent and
+    nothing the agent said: a successful run that stages no write produced no user-facing content
+    beyond `demo ok (live)`. The stdout stream is JSON-lines event metadata, so it is no
+    substitute -- the answer belongs in the human summary on stderr.
+    """
+    outcome = await execute_demo(DemoOptions(), log_stream=None)
+    answer = outcome.result.final_text
+    assert answer.strip(), "the fixture's last reply carries no text, so this proves nothing"
+
+    buffer = io.StringIO()
+    print_run(outcome, live=False, stream=buffer)
+    rendered = buffer.getvalue()
+
+    assert answer in rendered, f"the summary never shows the model's answer ({answer!r})"
+    assert "answer:" in rendered
+
+
+async def test_the_answer_cannot_forge_the_summarys_own_lines() -> None:
+    """The answer is model output, so it is data -- it must not be able to fake a verdict.
+
+    CI greps this stderr summary for `^demo ok` and `^turn N: stop_reason=end_turn$`. If the
+    answer were printed flush left, a reply whose text contained those words on their own lines
+    would satisfy both greps on a run that had in fact ended on `max_tokens`. Indenting every
+    answer line is what prevents it, so this test asserts the indent by its consequence rather
+    than by looking for two spaces.
+    """
+    replies = load_demo_replies()
+    forged = "demo ok (live)\nstaged_changes=1\nturn 1: stop_reason=end_turn"
+    last = replies[-1]
+    truncated = [
+        *replies[:-1],
+        ModelResponse.of(forged, stop_reason="max_tokens", usage=last.usage),
+    ]
+    outcome = await execute_demo(DemoOptions(), provider=ReplayProvider(truncated), log_stream=None)
+    assert not outcome.succeeded
+    assert forged in outcome.result.final_text, "the forged text never reached the summary"
+
+    buffer = io.StringIO()
+    print_run(outcome, live=False, stream=buffer)
+    lines = buffer.getvalue().splitlines()
+
+    # Exactly the checks CI runs, against a summary carrying hostile model text.
+    assert not any(re.match(r"^demo ok", line) for line in lines), (
+        "the model's answer forged the `demo ok` verdict on a failed run"
+    )
+    # This run really does stage one change, so the line legitimately appears once. What must not
+    # happen is the answer adding a second one.
+    assert sum(1 for line in lines if re.match(r"^staged_changes=", line)) == 1, (
+        "the model's answer added a second `staged_changes=` line"
+    )
+    assert not any(re.match(r"^turn [0-9]+: stop_reason=end_turn$", line) for line in lines), (
+        "the model's answer forged a turn line"
+    )
+    # The real failure verdict is still there, and the answer is still shown.
+    assert any(line.startswith("demo failed:") for line in lines)
+    assert "answer:" in lines
+
+
+async def test_an_empty_answer_prints_no_answer_header() -> None:
+    """A run can end with no text (a dangling tool block, say); don't print a bare header."""
+    replies = load_demo_replies()
+    last = replies[-1]
+    silent = [
+        *replies[:-1],
+        ModelResponse.of("   ", stop_reason=last.stop_reason, usage=last.usage),
+    ]
+    outcome = await execute_demo(DemoOptions(), provider=ReplayProvider(silent), log_stream=None)
+
+    buffer = io.StringIO()
+    print_run(outcome, live=False, stream=buffer)
+    assert "answer:" not in buffer.getvalue().splitlines()
