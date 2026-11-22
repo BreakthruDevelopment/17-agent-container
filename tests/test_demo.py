@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 from pathlib import Path
 
@@ -161,10 +162,30 @@ async def test_a_failed_run_stages_the_write_but_never_applies_it(
 
 
 def test_the_apply_gate_and_succeeded_share_one_predicate() -> None:
-    """They were separate once, and the apply ran unconditionally. Drift reintroduces the bug."""
-    source = Path("agent_container/demo.py").read_text()
-    body = source.split("async def execute_demo")[1]
-    assert "_run_succeeded(result)" in body, "the apply gate no longer uses the shared predicate"
-    assert body.count("end_reason ==") == 0 and body.count("end_reason is") == 0, (
-        "execute_demo compares end_reason directly instead of using _run_succeeded"
+    """They were separate once, and the apply ran unconditionally. Drift reintroduces the bug.
+
+    Parsed, not grepped. The first version of this test searched
+    `source.split("async def execute_demo")[1]` for the helper's name -- which was everything to
+    end of file, so it was not scoped to the function at all, and a comment line reading
+    `# gate: _run_succeeded(result)` satisfied it with the guard reverted. It detected nothing
+    the behavioural test above does not.
+    """
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "agent_container/demo.py").read_text())
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "execute_demo"
     )
+    called = {
+        node.func.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_run_succeeded" in called, "the apply gate no longer calls the shared predicate"
+    for node in ast.walk(function):
+        if isinstance(node, ast.Compare):
+            rendered = [ast.unparse(node.left), *(ast.unparse(c) for c in node.comparators)]
+            assert not any("end_reason" in part for part in rendered), (
+                f"execute_demo compares end_reason directly ({' '.join(rendered)}) "
+                "instead of using _run_succeeded"
+            )
