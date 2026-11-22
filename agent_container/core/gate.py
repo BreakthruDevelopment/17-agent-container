@@ -44,12 +44,25 @@ class ToolCallChange[A: BaseModel](StagedChange):
         self._args = args.model_copy(deep=True)
         self._ctx = ctx
         self._attempted = False
+        # Rendered once, now: this string is the record of what the approver was shown, and a
+        # record that moves is worse than none, because it reads as corroboration. Recomposing it
+        # on every read made it a live view of `self._args`, and `apply()` hands that very object
+        # to the tool -- so an interceptor's `before` hook beneath the gate (which holds the
+        # tool's own authority, and may legitimately clamp or normalise an argument) rewrote the
+        # audit text to match what ran. Described 5000, ran 100, read afterwards: 100. The
+        # execution was right; the approval was the thing that got lost.
+        self._full_description = (
+            f"{self._tool.name}: {self._tool.description} "
+            f"(arguments: {self._args.model_dump_json()})"
+        )
 
     @property
     def full_description(self) -> str:
-        """Everything, unshortened. A wrapper that redacts reads this, then shortens."""
-        shown = self._args.model_dump_json()
-        return f"{self._tool.name}: {self._tool.description} (arguments: {shown})"
+        """Everything, unshortened. A wrapper that redacts reads this, then shortens.
+
+        Fixed when the change was staged; see `__init__`.
+        """
+        return self._full_description
 
     @property
     def description(self) -> str:

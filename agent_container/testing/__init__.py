@@ -7,6 +7,16 @@ class TestMyProvider(ModelProviderContract):
         return MyProvider(...)  # one that answers with exactly these replies, in order
 """
 
-from agent_container.testing.contracts import ModelProviderContract, OverlapProbe, ToolContract
+from agent_container.testing.contracts import (
+    ModelProviderContract,
+    OverlapProbe,
+    StagedChangeContract,
+    ToolContract,
+)
 
-__all__ = ["ModelProviderContract", "OverlapProbe", "ToolContract"]
+__all__ = [
+    "ModelProviderContract",
+    "OverlapProbe",
+    "StagedChangeContract",
+    "ToolContract",
+]

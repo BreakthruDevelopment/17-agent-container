@@ -13,6 +13,7 @@ import pytest. Checks raise `AssertionError` explicitly so they still fail under
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import inspect
 import threading
@@ -36,6 +37,7 @@ from agent_container.core.tool import (
     AnyTool,
     Effect,
     ErrorCategory,
+    StagedChange,
     ToolContext,
     ToolResult,
     innermost,
@@ -257,3 +259,58 @@ class ToolContract(ABC):
         asyncio.run(tool.invoke(self.valid_input(), self._ctx()))
         again = asyncio.run(tool.invoke(self.valid_input(), self._ctx()))
         _require(isinstance(again, ToolResult), "a tool must be callable more than once")
+
+
+class StagedChangeContract(ABC):
+    """What every `StagedChange` must do: hold still.
+
+    `description` is the record of what a person was shown when they approved. Applying the change
+    must not alter it, whatever the applied call does -- an interceptor beneath a gate may clamp or
+    normalise an argument, and the execution then rightly follows the hook, but the record of the
+    approval must still say what the approver read. An audit trail that agrees with whatever
+    happened is worse than none: it reads as corroboration.
+
+    Subclass and supply a factory that stages one change, plus the hook that rewrites the
+    arguments under it. Both are needed: a factory alone cannot prove the description is frozen
+    rather than merely deterministic.
+    """
+
+    @abstractmethod
+    def make_change(self) -> StagedChange:
+        """A freshly staged change, not yet applied.
+
+        Its `apply()` must reach a hook that rewrites the arguments -- see `rewrites_arguments`.
+        """
+
+    @abstractmethod
+    def rewrites_arguments(self) -> bool:
+        """True if `make_change()`'s `apply()` really does rewrite the arguments beneath it.
+
+        Return False only for an implementation that cannot be wired that way; the test that
+        needs it is then skipped rather than passing vacuously.
+        """
+
+    def test_the_description_says_something(self) -> None:
+        text = self.make_change().description
+        _require(bool(text.strip()), "a staged change needs a description")
+
+    def test_reading_the_description_twice_gives_the_same_answer(self) -> None:
+        change = self.make_change()
+        _require(change.description == change.description, "description is not stable across reads")
+
+    def test_applying_does_not_rewrite_the_approval_record(self) -> None:
+        _require(
+            self.rewrites_arguments(),
+            "this contract needs a change whose apply() rewrites its arguments, or the test "
+            "passes without exercising anything; see `rewrites_arguments`",
+        )
+        change = self.make_change()
+        shown_at_approval = change.description
+        # A failing apply is fine here: the record must survive either way.
+        with contextlib.suppress(Exception):
+            asyncio.run(change.apply())
+        _require(
+            change.description == shown_at_approval,
+            "applying the change rewrote the record of what was approved: "
+            f"approved {shown_at_approval!r}, now reads {change.description!r}",
+        )

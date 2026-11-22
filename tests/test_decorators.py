@@ -33,9 +33,18 @@ from agent_container.core import (
     TurnOutputCap,
     has_write_gate,
 )
+from agent_container.core.decorators import _RedactedStaged
 from agent_container.core.interceptors import TURN_CAP_NOTICE, TURN_CAP_OMITTED
 from agent_container.testing import ToolContract
-from tests.support import DeleteTool, EchoArgs, EchoTool, scripted, tool_call, use_tool
+from tests.support import (
+    DeleteTool,
+    EchoArgs,
+    EchoTool,
+    scripted,
+    staged_pay_behind_a_clamp,
+    tool_call,
+    use_tool,
+)
 
 from agent_container.core import ModelResponse  # isort: skip
 
@@ -812,3 +821,50 @@ async def test_an_after_hook_that_mutates_the_model_cannot_reach_the_staged_chan
     assert change is not None
     await change.apply()
     assert tool.done == [("approved", 1, ())]
+
+
+def test_the_approval_record_survives_a_hook_that_rewrites_the_arguments() -> None:
+    """Stage, read, rewrite beneath the gate, apply, read again: the record must not have moved.
+
+    `description` used to recompose `f"{name}: {desc} (arguments: {args})"` from `self._args` on
+    every read, and `apply()` hands that very snapshot to the tool. So an interceptor's `before`
+    hook beneath the gate -- which holds the tool's own authority and may legitimately clamp an
+    amount -- rewrote the audit text to agree with what ran:
+
+        described 5000, ran 100, read afterwards 100.
+
+    The execution was right and consistent with the hook. What was lost is the record of what the
+    person was shown when they approved, and a record that silently agrees with whatever happened
+    is worse than none, because it reads as corroboration.
+    """
+    change, pay = staged_pay_behind_a_clamp(amount=5000, clamp_to=100)
+
+    shown_at_approval = change.description
+    assert "5000" in shown_at_approval, "the staged description never showed the approved amount"
+
+    asyncio.run(change.apply())
+
+    # The hook really did rewrite the call: without this the test would pass vacuously.
+    assert pay.paid == [100], f"the clamp hook did not run beneath the gate (paid {pay.paid})"
+
+    assert change.description == shown_at_approval, (
+        "applying rewrote the approval record: "
+        f"approved {shown_at_approval!r}, now reads {change.description!r}"
+    )
+    assert "100" not in change.description.split("amount")[-1], (
+        "the record reports the amount that ran, not the one approved"
+    )
+
+
+def test_redacting_does_not_thaw_the_approval_record() -> None:
+    """`_RedactedStaged` re-renders on every read, so it is frozen only if the change beneath is."""
+    change, pay = staged_pay_behind_a_clamp(amount=5000, clamp_to=100)
+    redacted = _RedactedStaged(change, Redacting(EchoTool(), [r"secret-\d+"]).redact)
+
+    shown_at_approval = redacted.description
+    asyncio.run(redacted.apply())
+
+    assert pay.paid == [100], "the clamp hook did not run"
+    assert redacted.description == shown_at_approval, (
+        "the redacting wrapper rewrote the approval record after apply()"
+    )

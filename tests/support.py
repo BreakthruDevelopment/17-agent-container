@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -12,9 +13,16 @@ from pydantic import BaseModel
 from agent_container.core import (
     AnyTool,
     Effect,
+    Identity,
+    Intercepted,
+    Interceptor,
+    InterceptorChain,
     ModelRequest,
     ModelResponse,
+    PermissionGate,
+    Policy,
     ReplayProvider,
+    StagedChange,
     TextBlock,
     Tool,
     ToolContext,
@@ -260,3 +268,59 @@ class StubConverseClient:
             if not self._wire:
                 raise AssertionError("the stub client ran out of replies")
             return self._wire.pop(0)
+
+
+class ClampArgs(BaseModel):
+    amount: int = 5000
+
+
+class ClampingPay(Tool[ClampArgs]):
+    """A write tool that records what it was actually asked to pay."""
+
+    name = "pay"
+    description = "Pay a supplier."
+    effect = Effect.WRITE
+    input_model = ClampArgs
+
+    def __init__(self) -> None:
+        self.paid: list[int] = []
+
+    async def run(self, args: ClampArgs, ctx: ToolContext) -> ToolResult:
+        self.paid.append(args.amount)
+        return ToolResult.ok(f"paid {args.amount}")
+
+
+class ClampTo(Interceptor):
+    """A `before` hook that rewrites an argument in place, as a policy hook legitimately may.
+
+    Positioned *beneath* a gate it holds the tool's own authority, so this is not a privilege
+    escalation -- which is exactly why the gate cannot rely on the arguments staying put.
+    """
+
+    def __init__(self, amount: int = 100) -> None:
+        self.amount = amount
+
+    async def before(self, tool: str, args: BaseModel, ctx: ToolContext) -> ToolResult | None:
+        if isinstance(args, ClampArgs):
+            args.amount = self.amount
+        return None
+
+
+def staged_pay_behind_a_clamp(
+    *, amount: int = 5000, clamp_to: int = 100
+) -> tuple[StagedChange, ClampingPay]:
+    """Stage one `pay` call through a gate with a clamping interceptor beneath it.
+
+    Returns the staged change and the leaf tool, so a caller can see both the record and what ran.
+    """
+    pay = ClampingPay()
+    gate = PermissionGate(
+        Intercepted(pay, InterceptorChain([ClampTo(clamp_to)])),
+        Policy.STAGED_WRITE,
+        requires="pay.write",
+    )
+    ctx = ToolContext("run-1", 1, "call-1", identity=Identity("u1", frozenset({"pay.write"})))
+    result = asyncio.run(gate.run(ClampArgs(amount=amount), ctx))
+    change = result.staged
+    assert change is not None, "the gate did not stage the write"
+    return change, pay
