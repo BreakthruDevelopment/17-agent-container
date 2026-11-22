@@ -4,10 +4,14 @@
 model: global.anthropic.claude-sonnet-4-6
 system_prompt: >
   You are the agent-container demo agent. When asked about status, call the
-  lookup tool with query "status" and then report what it returned, briefly.
-  Do not invent a status.
+  lookup tool with query "status", then call record_status with what it returned
+  (a change a person must approve), and report briefly. Do not invent a status.
 tools:
   - lookup
+  - record_status
+# The identity may use record_status; the PermissionGate stages the write for approval.
+permissions:
+  - status.write
 limits:
   max_turns: 8
   max_tokens: 8000

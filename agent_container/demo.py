@@ -10,6 +10,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from importlib import resources
 from typing import TextIO
 
@@ -19,9 +20,11 @@ from agent_container.core.bedrock import BedrockProvider
 from agent_container.core.builder import AgentBuilder, ManifestError
 from agent_container.core.decorators import Retrying
 from agent_container.core.errors import ReplayFormatError
+from agent_container.core.gate import PermissionGate
 from agent_container.core.limiter import RateLimitedProvider
 from agent_container.core.loop import (
     MAX_USER_MESSAGE_CHARS,
+    EndReason,
     LoopEvent,
     LoopEventKind,
     RunResult,
@@ -34,6 +37,11 @@ from agent_container.core.tool import Effect, ErrorCategory, Tool, ToolContext, 
 DEFAULT_MESSAGE = "What is the demo status?"
 DEFAULT_REGION = "us-east-2"
 MODEL_ENV = "AGENT_CONTAINER_MODEL"
+WRITE_PERMISSION = "status.write"  # also declared under `permissions:` in fixtures/demo.yaml
+
+# `lookup` fails this many times, then succeeds. Equal to Retrying's default max_attempts: the
+# first model-visible call is retried, then reported as a transient error; the second succeeds.
+LOOKUP_FAILURES = 3
 
 
 def _package_text(name: str) -> str:
@@ -92,21 +100,51 @@ class LookupTool(Tool[LookupArgs]):
     effect = Effect.READ
     input_model = LookupArgs
 
-    # Fail this many times, then succeed. Matches Retrying's default max_attempts: the first
-    # model-visible call is retried then reported as a transient error; the second succeeds.
-    _FAILURES = 3
-
     def __init__(self) -> None:
         self.attempts = 0
 
     async def run(self, args: LookupArgs, ctx: ToolContext) -> ToolResult:
         self.attempts += 1
-        if self.attempts <= self._FAILURES:
+        if self.attempts <= LOOKUP_FAILURES:
             return ToolResult.error(
                 ErrorCategory.TRANSIENT,
                 "lookup is temporarily unavailable",
             )
         return ToolResult.ok(f"status: ok (query={args.query})")
+
+
+class RecordStatusArgs(BaseModel):
+    status: str = Field(min_length=1, max_length=100)
+
+
+class RecordStatusTool(Tool[RecordStatusArgs]):
+    """A demo write. It only runs when a person approves the staged change."""
+
+    name = "record_status"
+    description = "Record the demo status. A write: it is staged for approval, not run at once."
+    effect = Effect.WRITE
+    input_model = RecordStatusArgs
+
+    def __init__(self) -> None:
+        self.recorded: list[str] = []
+
+    async def run(self, args: RecordStatusArgs, ctx: ToolContext) -> ToolResult:
+        self.recorded.append(args.status)
+        return ToolResult.ok(f"recorded status: {args.status}")
+
+
+@dataclass(frozen=True, slots=True)
+class DemoOutcome:
+    """What a demo run produced: the loop's result, each stop reason, and the approved writes."""
+
+    result: RunResult
+    stop_reasons: tuple[str, ...]
+    approved: tuple[str, ...]
+
+    @property
+    def succeeded(self) -> bool:
+        """The run ended because the model finished, not because a limit or a fault stopped it."""
+        return self.result.end_reason is EndReason.END_TURN
 
 
 class _StopReasons:
@@ -146,10 +184,15 @@ def lookup_stack() -> Retrying[LookupArgs]:
     """The demo tool: Retrying around lookup, delay zero so CI does not wait."""
     return Retrying(
         LookupTool(),
-        max_attempts=LookupTool._FAILURES,
+        max_attempts=LOOKUP_FAILURES,
         base_delay=0.0,
         max_delay=0.0,
     )
+
+
+def status_stack() -> PermissionGate[RecordStatusArgs]:
+    """The demo write behind its gate: staged for approval, for a caller holding the permission."""
+    return PermissionGate(RecordStatusTool(), requires=WRITE_PERMISSION)
 
 
 async def execute_demo(
@@ -157,11 +200,17 @@ async def execute_demo(
     *,
     provider: ModelProvider | None = None,
     log_stream: TextIO | None = None,
-) -> tuple[RunResult, tuple[str, ...]]:
-    """Build the demo agent and run it. `provider` is for tests; the CLI leaves it unset.
+    permissions: Sequence[str] | None = None,
+) -> DemoOutcome:
+    """Build the demo agent, run it, then approve what it staged. `provider` is for tests.
 
-    `log_stream` is the JSON-lines sink. The CLI passes `sys.stderr` at call time so a test
-    harness that replaces stderr still captures the lines. `None` skips the log.
+    `log_stream` is the JSON-lines sink: the CLI passes `sys.stdout` at call time (not as a
+    default argument) so a harness that replaces stdout still captures the lines. `None` skips
+    the log. `permissions`, when given, replaces the manifest's, so a test can run the same
+    agent as a caller without `status.write` and watch the gate refuse.
+
+    The approval is automatic here and says so: in a real deployment a person reads each
+    staged change's description and decides. Nothing staged runs until this point.
     """
     builder = AgentBuilder.from_yaml(demo_manifest_text())
     if options.model:
@@ -175,21 +224,26 @@ async def execute_demo(
     reasons = _StopReasons()
     if log_stream is not None:
         builder.with_json_log(log_stream)
-    loop = builder.with_provider(provider).with_tool(lookup_stack()).with_observer(reasons).build()
+    if permissions is not None:
+        builder.with_permissions(permissions)
+    builder.with_provider(provider).with_tool(lookup_stack()).with_tool(status_stack())
+    loop = builder.with_observer(reasons).build()
     result = await loop.run(options.message, builder.budget())
-    return result, tuple(reasons.reasons)
+    approved: list[str] = []
+    for change in result.staged_changes:
+        await change.apply()
+        approved.append(change.description)
+    return DemoOutcome(result, tuple(reasons.reasons), tuple(approved))
 
 
-def print_run(
-    result: RunResult,
-    *,
-    live: bool,
-    stop_reasons: Sequence[str],
-    stream: TextIO | None = None,
-) -> None:
-    """Human summary on stdout. CI greps `stop_reason=end_turn` and `demo ok` here."""
-    out = sys.stdout if stream is None else stream
-    reasons = list(stop_reasons) or ([result.stop_reason] if result.stop_reason else [])
+def print_run(outcome: DemoOutcome, *, live: bool, stream: TextIO | None = None) -> None:
+    """The human summary, on stderr. Stdout is reserved for the JSON-lines event stream.
+
+    `demo ok` is printed only when the run succeeded; the CLI's exit code says the same.
+    """
+    out = sys.stderr if stream is None else stream
+    result = outcome.result
+    reasons = list(outcome.stop_reasons) or ([result.stop_reason] if result.stop_reason else [])
     for turn, reason in enumerate(reasons, start=1):
         print(f"turn {turn}: stop_reason={reason}", file=out)
     print(f"end_reason={result.end_reason}", file=out)
@@ -198,19 +252,58 @@ def print_run(
     print(f"tool_calls={len(result.tool_calls)}", file=out)
     if result.staged_changes:
         print(f"staged_changes={len(result.staged_changes)}", file=out)
-    if live:
+    for description in outcome.approved:
+        print(f"approved: {description}", file=out)
+    if not outcome.succeeded:
+        print(f"demo failed: the run ended with end_reason={result.end_reason}", file=out)
+    elif live:
         print("demo ok (live)", file=out)
     else:
         print("demo ok (replay, no network)", file=out)
 
 
+EVENT_FIELDS = frozenset({"run_id", "turn", "tool", "outcome", "tokens", "duration"})
+REQUIRED_OUTCOMES = frozenset({"model_called", "tool_called"})
+
+
+def validate_event_stream(text: str) -> None:
+    """Raise ValueError unless `text` is a well-formed JSON-lines event stream.
+
+    Every non-blank line must be a JSON object with exactly the six event fields, and the stream
+    must show the loop working (a model call and a tool call). An empty stream fails: a dead
+    event bus is exactly what the CI smoke step must catch.
+    """
+    outcomes: set[str] = set()
+    count = 0
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row: object = json.loads(line)
+        except ValueError:
+            raise ValueError(f"line {number} of the event stream is not JSON") from None
+        if not isinstance(row, dict) or set(row) != EVENT_FIELDS:
+            raise ValueError(f"line {number} of the event stream is not an event object")
+        outcomes.add(str(row["outcome"]))
+        count += 1
+    if count == 0:
+        raise ValueError("the event stream is empty: no events were logged")
+    if missing := REQUIRED_OUTCOMES - outcomes:
+        raise ValueError(f"the event stream never shows {sorted(missing)}")
+
+
 __all__ = [
     "DEFAULT_MESSAGE",
     "DEFAULT_REGION",
+    "LOOKUP_FAILURES",
     "MODEL_ENV",
+    "WRITE_PERMISSION",
     "DemoOptions",
+    "DemoOutcome",
     "LookupArgs",
     "LookupTool",
+    "RecordStatusArgs",
+    "RecordStatusTool",
     "demo_manifest_text",
     "demo_recording",
     "execute_demo",
@@ -220,4 +313,6 @@ __all__ = [
     "print_run",
     "resolve_model",
     "resolve_region",
+    "status_stack",
+    "validate_event_stream",
 ]

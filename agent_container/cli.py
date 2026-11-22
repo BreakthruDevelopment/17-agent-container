@@ -56,17 +56,21 @@ def _options_from_args(args: argparse.Namespace) -> DemoOptions:
 
 
 def demo(options: DemoOptions) -> int:
-    """Run the demo and print a summary. 0 on success; 1 on a run failure; 2 on bad input."""
+    """Run the demo. Events go to stdout as JSON lines, the summary to stderr.
+
+    0 only when the run ended on `end_turn`; 1 when it failed or ended any other way; 2 on bad
+    input.
+    """
     try:
-        result, reasons = asyncio.run(execute_demo(options, log_stream=sys.stderr))
+        outcome = asyncio.run(execute_demo(options, log_stream=sys.stdout))
     except AgentContainerError as exc:
         print(f"demo failed: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
         print(f"demo failed: {type(exc).__name__}", file=sys.stderr)
         return 1
-    print_run(result, live=options.live, stop_reasons=reasons)
-    return 0
+    print_run(outcome, live=options.live)
+    return 0 if outcome.succeeded else 1
 
 
 def main(argv: list[str] | None = None) -> int:
