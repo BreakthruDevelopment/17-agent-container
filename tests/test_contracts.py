@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
-from pydantic import JsonValue
+import pytest
+from pydantic import BaseModel, JsonValue
 
 from agent_container.core import AnyTool, ModelProvider, ModelResponse, StagedChange
 from agent_container.core.decorators import Redacting, _RedactedStaged
@@ -60,12 +61,9 @@ class TestDecoratedToolContract(ToolContract):
 class TestToolCallChangeContract(StagedChangeContract):
     """`PermissionGate`'s own staged change, with a clamping hook beneath the gate."""
 
-    def make_change(self) -> StagedChange:
-        change, _ = staged_pay_behind_a_clamp()
-        return change
-
-    def rewrites_arguments(self) -> bool:
-        return True
+    def make_change(self) -> tuple[StagedChange, Callable[[], Sequence[object]]]:
+        change, pay = staged_pay_behind_a_clamp()
+        return change, lambda: pay.paid
 
 
 class TestRedactedStagedContract(StagedChangeContract):
@@ -74,9 +72,58 @@ class TestRedactedStagedContract(StagedChangeContract):
     It reads `full_description` from the change beneath it, so it is frozen only if that one is.
     """
 
-    def make_change(self) -> StagedChange:
-        change, _ = staged_pay_behind_a_clamp()
-        return _RedactedStaged(change, Redacting(EchoTool(), [r"secret-\d+"]).redact)
+    def make_change(self) -> tuple[StagedChange, Callable[[], Sequence[object]]]:
+        change, pay = staged_pay_behind_a_clamp()
+        redacting = Redacting(EchoTool(), [r"secret-\d+"])
+        return _RedactedStaged(change, redacting.redact), lambda: pay.paid
 
-    def rewrites_arguments(self) -> bool:
-        return True
+
+# -- The contract suite must itself be able to fail -----------------------------------------------
+# A contract suite that passes against a broken implementation is worse than no suite, because
+# every downstream consumer inherits the false assurance. Apps 18 and 19 will subclass
+# `StagedChangeContract` for their own staged changes, so these two cases pin that it bites. The
+# first version of the suite asked the subclass to *declare* that its arguments get rewritten; both
+# cases below passed it green.
+
+
+class _ThawedArgs(BaseModel):
+    amount: int
+
+
+class _Thawed(StagedChange):
+    """Not frozen at all: the description is recomposed live, and `apply()` reaches no tool."""
+
+    def __init__(self) -> None:
+        self.args = _ThawedArgs(amount=5000)
+
+    @property
+    def description(self) -> str:
+        return f"pay: {self.args.amount}"
+
+    async def apply(self) -> None:
+        self.args.amount = 100
+
+
+class _ThawedCase(StagedChangeContract):
+    """Reports no applied call, because there is none."""
+
+    def make_change(self) -> tuple[StagedChange, Callable[[], Sequence[object]]]:
+        return _Thawed(), lambda: []
+
+
+class _UnrewrittenCase(StagedChangeContract):
+    """A real staged change, but the hook beneath leaves the arguments alone."""
+
+    def make_change(self) -> tuple[StagedChange, Callable[[], Sequence[object]]]:
+        change, pay = staged_pay_behind_a_clamp(amount=5000, clamp_to=5000)
+        return change, lambda: pay.paid
+
+
+def test_the_contract_rejects_a_change_whose_apply_reaches_nothing() -> None:
+    with pytest.raises(AssertionError, match="never reached the tool"):
+        _ThawedCase().test_applying_does_not_rewrite_the_approval_record()
+
+
+def test_the_contract_rejects_a_hook_that_does_not_rewrite_the_arguments() -> None:
+    with pytest.raises(AssertionError, match="already reports"):
+        _UnrewrittenCase().test_applying_does_not_rewrite_the_approval_record()

@@ -18,7 +18,7 @@ import copy
 import inspect
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from pydantic import BaseModel, JsonValue
 
@@ -270,45 +270,60 @@ class StagedChangeContract(ABC):
     approval must still say what the approver read. An audit trail that agrees with whatever
     happened is worse than none: it reads as corroboration.
 
-    Subclass and supply a factory that stages one change, plus the hook that rewrites the
-    arguments under it. Both are needed: a factory alone cannot prove the description is frozen
-    rather than merely deterministic.
+    Subclass and supply a factory that stages one change **and a probe of what the applied call
+    actually received**. The probe is not a formality: without it this suite cannot tell a frozen
+    description from a merely deterministic one, and an implementation whose `apply()` never
+    reaches the tool would pass every test here while being wide open. An earlier version of this
+    suite asked the subclass to *declare* that its arguments get rewritten, which is an
+    unverifiable promise -- a staged change that recomposed its description live, with a no-op
+    `apply()`, passed all three tests green. The probe is checked instead.
     """
 
     @abstractmethod
-    def make_change(self) -> StagedChange:
-        """A freshly staged change, not yet applied.
+    def make_change(self) -> tuple[StagedChange, Callable[[], Sequence[object]]]:
+        """A freshly staged change, not yet applied, and a probe of the applied call.
 
-        Its `apply()` must reach a hook that rewrites the arguments -- see `rewrites_arguments`.
+        The probe returns what the tool beneath actually received, in call order -- empty before
+        `apply()`. `apply()` must reach a hook that **rewrites** those arguments, so that a live
+        description would read differently from the staged one; this suite verifies that rather
+        than taking your word for it.
         """
 
-    @abstractmethod
-    def rewrites_arguments(self) -> bool:
-        """True if `make_change()`'s `apply()` really does rewrite the arguments beneath it.
-
-        Return False only for an implementation that cannot be wired that way; the test that
-        needs it is then skipped rather than passing vacuously.
-        """
+    def _staged(self) -> tuple[StagedChange, Callable[[], Sequence[object]]]:
+        change, probe = self.make_change()
+        _require(not probe(), "the probe reports a call before apply() was called")
+        return change, probe
 
     def test_the_description_says_something(self) -> None:
-        text = self.make_change().description
-        _require(bool(text.strip()), "a staged change needs a description")
+        change, _ = self.make_change()
+        _require(bool(change.description.strip()), "a staged change needs a description")
 
     def test_reading_the_description_twice_gives_the_same_answer(self) -> None:
-        change = self.make_change()
-        _require(change.description == change.description, "description is not stable across reads")
+        change, _ = self.make_change()
+        first = change.description
+        second = change.description
+        _require(first == second, f"description moved between reads: {first!r} then {second!r}")
 
     def test_applying_does_not_rewrite_the_approval_record(self) -> None:
-        _require(
-            self.rewrites_arguments(),
-            "this contract needs a change whose apply() rewrites its arguments, or the test "
-            "passes without exercising anything; see `rewrites_arguments`",
-        )
-        change = self.make_change()
+        change, probe = self._staged()
         shown_at_approval = change.description
         # A failing apply is fine here: the record must survive either way.
         with contextlib.suppress(Exception):
             asyncio.run(change.apply())
+
+        # The vacuity guard, measured rather than declared. If the applied call received what the
+        # description already says, a live description would read the same as a frozen one and the
+        # assertion below would pass without testing anything.
+        received = list(probe())
+        _require(bool(received), "apply() never reached the tool, so this test proves nothing")
+        rewritten = str(received[-1])
+        _require(
+            rewritten not in shown_at_approval,
+            f"the applied call received {rewritten!r}, which the staged description "
+            f"{shown_at_approval!r} already reports: wire a hook that rewrites the arguments, or "
+            "this suite cannot tell a frozen description from a live one",
+        )
+
         _require(
             change.description == shown_at_approval,
             "applying the change rewrote the record of what was approved: "

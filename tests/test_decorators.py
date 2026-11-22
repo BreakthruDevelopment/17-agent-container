@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import pytest
 from pydantic import BaseModel, JsonValue
+from pydantic_core import PydanticSerializationError
 
 from agent_container.core import (
     AgentLoop,
@@ -868,3 +869,38 @@ def test_redacting_does_not_thaw_the_approval_record() -> None:
     assert redacted.description == shown_at_approval, (
         "the redacting wrapper rewrote the approval record after apply()"
     )
+
+
+def test_an_undescribable_write_fails_at_the_gate_not_at_the_approver() -> None:
+    """Freezing the text moved serialization from the first `description` read into staging.
+
+    That is a behaviour change and worth pinning rather than discovering. Before, the gate
+    returned a staged change whose `description` raised when a person tried to read it: an
+    approval request that cannot be described, which is useless to the approver and surfaces the
+    fault in whatever is rendering the queue. Now it raises inside `PermissionGate.run`, where the
+    loop turns a raised exception into an `internal`, non-retryable result and the model is told
+    the tool call failed. Nothing is staged, which is right -- there is nothing a person could
+    sensibly approve.
+    """
+
+    class WeirdArgs(BaseModel):
+        model_config = {"arbitrary_types_allowed": True}
+        payload: object = None
+
+    class Unserializable:
+        pass
+
+    class WeirdWrite(Tool[WeirdArgs]):
+        name = "weird"
+        description = "Write something odd."
+        effect = Effect.WRITE
+        input_model = WeirdArgs
+
+        async def run(self, args: WeirdArgs, ctx: ToolContext) -> ToolResult:
+            raise AssertionError("the write must never run: staging failed")
+
+    gate = PermissionGate(WeirdWrite(), Policy.STAGED_WRITE, requires="weird.write")
+    context = ToolContext("run-1", 1, "call-1", identity=Identity("u1", frozenset({"weird.write"})))
+
+    with pytest.raises(PydanticSerializationError):
+        asyncio.run(gate.run(WeirdArgs(payload=Unserializable()), context))
