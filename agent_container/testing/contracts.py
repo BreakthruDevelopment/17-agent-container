@@ -13,11 +13,13 @@ import pytest. Checks raise `AssertionError` explicitly so they still fail under
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import inspect
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 
 from pydantic import BaseModel, JsonValue
 
@@ -36,6 +38,7 @@ from agent_container.core.tool import (
     AnyTool,
     Effect,
     ErrorCategory,
+    StagedChange,
     ToolContext,
     ToolResult,
     innermost,
@@ -257,3 +260,137 @@ class ToolContract(ABC):
         asyncio.run(tool.invoke(self.valid_input(), self._ctx()))
         again = asyncio.run(tool.invoke(self.valid_input(), self._ctx()))
         _require(isinstance(again, ToolResult), "a tool must be callable more than once")
+
+
+@dataclass(frozen=True)
+class StagedCase:
+    """One staged change to put through `StagedChangeContract`, with what the suite needs to
+    check that the case really exercises a freeze.
+
+    `approved_value` and `rewritten_value` are not taken on trust: the suite asserts each appears
+    where it must and is absent where it must not, so a case that does not genuinely rewrite the
+    described argument fails rather than passing quietly.
+    """
+
+    change: StagedChange
+    """Freshly staged, not yet applied."""
+
+    applied: Callable[[], Sequence[object]]
+    """What the tool beneath actually received, in call order. Empty before `apply()`."""
+
+    approved_value: str
+    """The argument as the staged record reports it -- must appear in `description`."""
+
+    rewritten_value: str
+    """The argument as the applied call receives it -- must not appear in `description`."""
+
+    recomposed: Callable[[], str]
+    """What the record *would* read if it were rendered now, from the arguments as they stand
+    after `apply()`. The suite asserts this differs from the staged record: without it the four
+    substring relations above can all hold while the rewritten argument is one the record never
+    displays, in which case a live description would not have moved either and the freeze test
+    passes on a change that is not frozen."""
+
+
+class StagedChangeContract(ABC):
+    """What every `StagedChange` must do: hold still.
+
+    `description` is the record of what a person was shown when they approved. Applying the change
+    must not alter it, whatever the applied call does -- an interceptor beneath a gate may clamp or
+    normalise an argument, and the execution then rightly follows the hook, but the record of the
+    approval must still say what the approver read. An audit trail that agrees with whatever
+    happened is worse than none: it reads as corroboration.
+
+    Subclass and supply a `StagedCase`. Every part of it is checked, because two earlier versions
+    of this suite could be passed by something that was not frozen at all:
+
+    - The first asked the subclass to *declare* `rewrites_arguments() -> True`. An unverifiable
+      promise: a change that recomposed its description live, with a **no-op** `apply()`, passed
+      all three tests green.
+    - The second checked a probe, but one-sidedly -- it asserted the applied value was *absent*
+      from the record and never that the approved value was *present*. Two cases defeated it with
+      a live, unfrozen description: a probe reporting the arguments model (`'amount=5000'`) rather
+      than the scalar, so the substring never matched; and a tool description long enough that
+      `limit_description` truncated the arguments off the end, so the check was trivially true.
+
+    So both values are pinned from both sides: a case must have a value the record reports and the
+    applied call did not receive, *and* a value the applied call received and the record does not
+    report. Those four relations are still only facts about two strings, and a third version of
+    this suite overstated them -- nothing in them ties the two values to the **same** argument, so
+    a case that rewrote a field the record never displays satisfied all four while a provably live
+    description went green. `recomposed` closes that: the suite renders the record from the
+    arguments as they stand after `apply()` and requires it to differ from the staged record, so
+    the rewrite must be one a live description would have shown.
+
+    What remains on trust, irreducibly: `applied` and `recomposed` are the subclass's own
+    observations of its own implementation. A subclass that fabricates either -- a probe returning
+    a value no call produced, a renderer returning a string it never renders -- can still pass.
+    The suite checks that they are consistent with each other and with the record; it cannot check
+    that they are honest. Write them as thin views over real state, not as literals.
+    """
+
+    @abstractmethod
+    def make_change(self) -> StagedCase:
+        """A fresh `StagedCase`. Called more than once; return a new change each time."""
+
+    def test_the_description_says_something(self) -> None:
+        case = self.make_change()
+        _require(bool(case.change.description.strip()), "a staged change needs a description")
+
+    def test_reading_the_description_twice_gives_the_same_answer(self) -> None:
+        change = self.make_change().change
+        first = change.description
+        second = change.description
+        _require(first == second, f"description moved between reads: {first!r} then {second!r}")
+
+    def test_applying_does_not_rewrite_the_approval_record(self) -> None:
+        case = self.make_change()
+        _require(not case.applied(), "the probe reports a call before apply() was called")
+        shown_at_approval = case.change.description
+
+        # The record must report the approved value. Without this the rest can be satisfied by a
+        # description that never mentioned the argument at all -- a truncated one, say.
+        _require(
+            case.approved_value in shown_at_approval,
+            f"the staged description {shown_at_approval!r} does not report the approved value "
+            f"{case.approved_value!r}, so this case cannot show whether the record is frozen",
+        )
+        _require(
+            case.rewritten_value not in shown_at_approval,
+            f"the staged description already reports {case.rewritten_value!r}, the value the "
+            "applied call receives, so a live description would read the same as a frozen one",
+        )
+
+        # A failing apply is fine here: the record must survive either way.
+        with contextlib.suppress(Exception):
+            asyncio.run(case.change.apply())
+
+        received = list(case.applied())
+        _require(bool(received), "apply() never reached the tool, so this test proves nothing")
+        applied_repr = str(received[-1])
+        _require(
+            case.rewritten_value in applied_repr,
+            f"the applied call received {applied_repr!r}, not the rewritten value "
+            f"{case.rewritten_value!r} this case promised",
+        )
+        _require(
+            case.approved_value not in applied_repr,
+            f"the applied call received {applied_repr!r}, which still carries the approved value "
+            f"{case.approved_value!r}: nothing rewrote the argument, so this test proves nothing",
+        )
+
+        # The rewrite must be one the record would have shown. Otherwise a live description would
+        # read the same as a frozen one and the assertion below proves nothing.
+        would_read_now = case.recomposed()
+        _require(
+            would_read_now != shown_at_approval,
+            f"rendering the record from the arguments as they now stand gives {would_read_now!r}, "
+            f"the same text as the staged record: the applied call rewrote something the record "
+            "never displays, so this test cannot tell a frozen description from a live one",
+        )
+
+        _require(
+            case.change.description == shown_at_approval,
+            "applying the change rewrote the record of what was approved: "
+            f"approved {shown_at_approval!r}, now reads {case.change.description!r}",
+        )

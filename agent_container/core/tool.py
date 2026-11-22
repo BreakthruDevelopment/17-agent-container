@@ -52,7 +52,17 @@ class StagedChange(ABC):
     @property
     @abstractmethod
     def description(self) -> str:
-        """What this change would do, in words a person reads before approving."""
+        """What this change would do, in words a person reads before approving.
+
+        **It is the record of what was shown at approval, so it must not move.** Fixed when the
+        change is staged, and the same string before and after `apply()`, whatever the applied
+        call turns out to do: an interceptor beneath a gate may legitimately clamp or normalise
+        an argument, and the execution then rightly follows the hook -- but an audit trail that
+        silently agrees with whatever happened is worse than none, because it reads as
+        corroboration. Render it once, from a snapshot; never recompose it from state the applied
+        call can reach. `StagedChangeContract` in `agent_container.testing` checks this, and apps
+        18 and 19 both depend on an approval record surviving.
+        """
 
     @abstractmethod
     async def apply(self) -> None:

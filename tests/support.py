@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -12,9 +13,16 @@ from pydantic import BaseModel
 from agent_container.core import (
     AnyTool,
     Effect,
+    Identity,
+    Intercepted,
+    Interceptor,
+    InterceptorChain,
     ModelRequest,
     ModelResponse,
+    PermissionGate,
+    Policy,
     ReplayProvider,
+    StagedChange,
     TextBlock,
     Tool,
     ToolContext,
@@ -22,6 +30,7 @@ from agent_container.core import (
     ToolUseBlock,
     Usage,
 )
+from agent_container.core.decorators import MAX_DESCRIPTION_CHARS, limit_description
 from agent_container.testing import OverlapProbe
 
 
@@ -260,3 +269,85 @@ class StubConverseClient:
             if not self._wire:
                 raise AssertionError("the stub client ran out of replies")
             return self._wire.pop(0)
+
+
+class ClampArgs(BaseModel):
+    amount: int = 5000
+
+
+class ClampingPay(Tool[ClampArgs]):
+    """A write tool that records what it was actually asked to pay."""
+
+    name = "pay"
+    description = "Pay a supplier."
+    effect = Effect.WRITE
+    input_model = ClampArgs
+
+    def __init__(self, description: str | None = None) -> None:
+        self.paid: list[int] = []
+        # The same record at model granularity: the idiom `EchoTool.calls` uses. A probe reporting
+        # this instead of the scalar defeated an earlier, one-sided version of
+        # `StagedChangeContract`, so a case using it is checked in.
+        self.received: list[ClampArgs] = []
+        if description is not None:
+            self.description = description
+
+    async def run(self, args: ClampArgs, ctx: ToolContext) -> ToolResult:
+        self.paid.append(args.amount)
+        self.received.append(args)
+        return ToolResult.ok(f"paid {args.amount}")
+
+
+class ClampTo(Interceptor):
+    """A `before` hook that rewrites an argument in place, as a policy hook legitimately may.
+
+    Positioned *beneath* a gate it holds the tool's own authority, so this is not a privilege
+    escalation -- which is exactly why the gate cannot rely on the arguments staying put.
+    """
+
+    def __init__(self, amount: int = 100) -> None:
+        self.amount = amount
+
+    async def before(self, tool: str, args: BaseModel, ctx: ToolContext) -> ToolResult | None:
+        if isinstance(args, ClampArgs):
+            args.amount = self.amount
+        return None
+
+
+def staged_pay_behind_a_clamp(
+    *, amount: int = 5000, clamp_to: int = 100, long_description: bool = False
+) -> tuple[StagedChange, ClampingPay]:
+    """Stage one `pay` call through a gate with a clamping interceptor beneath it.
+
+    Returns the staged change and the leaf tool, so a caller can see both the record and what ran.
+    `long_description` pushes `full_description` past `MAX_DESCRIPTION_CHARS` so that
+    `limit_description` truncates the arguments off the end -- the shape that defeated an earlier
+    version of `StagedChangeContract`.
+    """
+    pay = ClampingPay(
+        "Pay a supplier. " + "x" * MAX_DESCRIPTION_CHARS if long_description else None
+    )
+    gate = PermissionGate(
+        Intercepted(pay, InterceptorChain([ClampTo(clamp_to)])),
+        Policy.STAGED_WRITE,
+        requires="pay.write",
+    )
+    ctx = ToolContext("run-1", 1, "call-1", identity=Identity("u1", frozenset({"pay.write"})))
+    result = asyncio.run(gate.run(ClampArgs(amount=amount), ctx))
+    change = result.staged
+    assert change is not None, "the gate did not stage the write"
+    return change, pay
+
+
+def pay_record_as_it_would_read(
+    pay: ClampingPay, redact: Callable[[str], str] | None = None
+) -> str:
+    """Render the staged record from the `pay` arguments as they now stand.
+
+    A thin view over real state, which is what `StagedCase.recomposed` must be: it reads the very
+    model object the applied call received -- the same object the gate snapshotted, which is why
+    the defect existed -- and renders it exactly as `ToolCallChange` would.
+    """
+    args = pay.received[-1] if pay.received else ClampArgs()
+    full = f"{pay.name}: {pay.description} (arguments: {args.model_dump_json()})"
+    return limit_description(redact(full) if redact else full)
