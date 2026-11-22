@@ -30,6 +30,7 @@ from agent_container.core import (
     ToolUseBlock,
     Usage,
 )
+from agent_container.core.decorators import MAX_DESCRIPTION_CHARS
 from agent_container.testing import OverlapProbe
 
 
@@ -282,11 +283,18 @@ class ClampingPay(Tool[ClampArgs]):
     effect = Effect.WRITE
     input_model = ClampArgs
 
-    def __init__(self) -> None:
+    def __init__(self, description: str | None = None) -> None:
         self.paid: list[int] = []
+        # The same record at model granularity: the idiom `EchoTool.calls` uses. A probe reporting
+        # this instead of the scalar defeated an earlier, one-sided version of
+        # `StagedChangeContract`, so a case using it is checked in.
+        self.received: list[ClampArgs] = []
+        if description is not None:
+            self.description = description
 
     async def run(self, args: ClampArgs, ctx: ToolContext) -> ToolResult:
         self.paid.append(args.amount)
+        self.received.append(args)
         return ToolResult.ok(f"paid {args.amount}")
 
 
@@ -307,13 +315,18 @@ class ClampTo(Interceptor):
 
 
 def staged_pay_behind_a_clamp(
-    *, amount: int = 5000, clamp_to: int = 100
+    *, amount: int = 5000, clamp_to: int = 100, long_description: bool = False
 ) -> tuple[StagedChange, ClampingPay]:
     """Stage one `pay` call through a gate with a clamping interceptor beneath it.
 
     Returns the staged change and the leaf tool, so a caller can see both the record and what ran.
+    `long_description` pushes `full_description` past `MAX_DESCRIPTION_CHARS` so that
+    `limit_description` truncates the arguments off the end -- the shape that defeated an earlier
+    version of `StagedChangeContract`.
     """
-    pay = ClampingPay()
+    pay = ClampingPay(
+        "Pay a supplier. " + "x" * MAX_DESCRIPTION_CHARS if long_description else None
+    )
     gate = PermissionGate(
         Intercepted(pay, InterceptorChain([ClampTo(clamp_to)])),
         Policy.STAGED_WRITE,

@@ -10,6 +10,7 @@ class TestMyProvider(ModelProviderContract):
 from agent_container.testing.contracts import (
     ModelProviderContract,
     OverlapProbe,
+    StagedCase,
     StagedChangeContract,
     ToolContract,
 )
@@ -17,6 +18,7 @@ from agent_container.testing.contracts import (
 __all__ = [
     "ModelProviderContract",
     "OverlapProbe",
+    "StagedCase",
     "StagedChangeContract",
     "ToolContract",
 ]
