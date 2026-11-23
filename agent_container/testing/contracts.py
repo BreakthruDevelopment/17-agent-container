@@ -285,11 +285,16 @@ class StagedCase:
     """The argument as the applied call receives it -- must not appear in `description`."""
 
     recomposed: Callable[[], str]
-    """What the record *would* read if it were rendered now, from the arguments as they stand
-    after `apply()`. The suite asserts this differs from the staged record: without it the four
-    substring relations above can all hold while the rewritten argument is one the record never
-    displays, in which case a live description would not have moved either and the freeze test
-    passes on a change that is not frozen."""
+    """What the record *would* read if it were rendered now, from the arguments as they stand.
+
+    Called twice: before `apply()`, where the suite requires it to **equal** the record, and
+    after, where it must **differ**. Without the difference the four substring relations above can
+    all hold while the rewritten argument is one the record never displays, in which case a live
+    description would not have moved either and the freeze test passes on a change that is not
+    frozen. Without the equality the difference can come from anywhere -- a timestamp, a read
+    counter, a step this renderer does not share with the record -- which is how five
+    provably-unfrozen witnesses passed. It must render the record, not merely resemble it: same
+    pipeline, reading real state rather than literals."""
 
 
 class StagedChangeContract(ABC):
@@ -322,11 +327,23 @@ class StagedChangeContract(ABC):
     arguments as they stand after `apply()` and requires it to differ from the staged record, so
     the rewrite must be one a live description would have shown.
 
-    What remains on trust, irreducibly: `applied` and `recomposed` are the subclass's own
-    observations of its own implementation. A subclass that fabricates either -- a probe returning
-    a value no call produced, a renderer returning a string it never renders -- can still pass.
-    The suite checks that they are consistent with each other and with the record; it cannot check
-    that they are honest. Write them as thin views over real state, not as literals.
+    A fourth version checked that difference and nothing else, which let the difference arise for
+    a reason unrelated to the rewrite. Five of six provably-unfrozen witnesses passed it: a
+    `recomposed` carrying a timestamp or a read counter differed on every call; one differing by a
+    pipeline step the record has and it does not (which is not fabrication -- it can be a real,
+    byte-for-byte render of real state, just not of the record under test); one rendering the same
+    argument a different way, so it differed *because of* the rewrite and looked like the check
+    firing correctly. So the suite now **calibrates the two renderers before applying**: rendered
+    at stage time, `recomposed()` must equal the record. A renderer that agrees with the record
+    before `apply()` and differs after can only differ because of what `apply()` did.
+
+    What remains on trust: `applied` and `recomposed` are the subclass's own observations of its
+    own implementation. A subclass that fabricates either -- a probe returning a value no call
+    produced, a renderer returning a string it never renders -- can still pass, though the
+    calibration narrows that too: a fabricated renderer must now match the record exactly at stage
+    time. The suite checks that `applied` is consistent with the record, and that `recomposed`
+    agrees with it before `apply()` and disagrees after; it cannot check that either is honest.
+    Write them as thin views over real state, not as literals.
     """
 
     @abstractmethod
@@ -359,6 +376,19 @@ class StagedChangeContract(ABC):
             case.rewritten_value not in shown_at_approval,
             f"the staged description already reports {case.rewritten_value!r}, the value the "
             "applied call receives, so a live description would read the same as a frozen one",
+        )
+
+        # Calibration, before anything is applied: the case's own renderer must agree with the
+        # record it is meant to re-render. Without this the difference asserted after `apply()`
+        # can come from anywhere -- a timestamp, a read counter, a pipeline step the renderer
+        # does not share with the record -- and five provably-unfrozen witnesses passed on
+        # exactly that. Agreement now, disagreement later, is what ties the difference to the
+        # rewrite.
+        _require(
+            case.recomposed() == shown_at_approval,
+            "this case's `recomposed` does not render the record: before apply() it reads "
+            f"{case.recomposed()!r} while the record reads {shown_at_approval!r}. A renderer "
+            "that disagrees with the record already cannot show that applying moved it.",
         )
 
         # A failing apply is fine here: the record must survive either way.

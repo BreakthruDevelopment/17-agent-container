@@ -35,7 +35,11 @@ from agent_container.core import (
     TurnOutputCap,
     has_write_gate,
 )
-from agent_container.core.decorators import _RedactedStaged, limit_description
+from agent_container.core.decorators import (
+    MAX_DESCRIPTION_CHARS,
+    _RedactedStaged,
+    limit_description,
+)
 from agent_container.core.interceptors import TURN_CAP_NOTICE, TURN_CAP_OMITTED
 from agent_container.testing import ToolContract
 from tests.support import (
@@ -859,7 +863,7 @@ def test_the_approval_record_survives_a_hook_that_rewrites_the_arguments() -> No
 
 
 def test_redacting_does_not_thaw_the_approval_record() -> None:
-    """`_RedactedStaged` re-renders on every read, so it is frozen only if the change beneath is."""
+    """`_RedactedStaged` reads the change beneath it, so it is frozen only if that one is too."""
     change, pay = staged_pay_behind_a_clamp(amount=5000, clamp_to=100)
     redacted = _RedactedStaged(change, Redacting(EchoTool(), [r"secret-\d+"]).redact)
 
@@ -922,6 +926,24 @@ async def test_patching_the_display_limit_after_staging_does_not_shorten_the_rec
     )
 
 
+async def test_the_redacted_record_is_shortened_to_the_display_limit() -> None:
+    """Nothing pinned that the wrapper shortens the record *at all*, only that it does not move.
+
+    Measured: replacing `limit_description(self._full_description)` with the raw string left all
+    591 tests green. The straddling test above asserts a secret is absent, which a longer record
+    satisfies just as well.
+    """
+    long_text = "a" * (MAX_DESCRIPTION_CHARS * 2)
+    staged = (
+        await Redacting(PermissionGate(CountingWrite()), [PATTERN]).run(
+            EchoArgs(text=long_text), ctx()
+        )
+    ).staged
+    assert staged is not None, "the gate did not stage the write"
+    assert staged.description.endswith("...")
+    assert len(staged.description) == MAX_DESCRIPTION_CHARS + len("...")
+
+
 async def test_a_change_that_cannot_be_described_fails_where_it_is_staged() -> None:
     """Rendering at staging moves this failure into `Redacting.run`, as the gate's did.
 
@@ -929,6 +951,10 @@ async def test_a_change_that_cannot_be_described_fails_where_it_is_staged() -> N
     pins one layer down, and worth pinning rather than discovering: the loop turns a raised
     exception into an `internal`, non-retryable result, so the model is told the call failed and
     nothing is staged -- which is right, because there is nothing a person could read to approve.
+    That handling is itself pinned, in `tests/test_loop.py`, by
+    `test_a_tool_that_raises_is_categorised_internal_not_business` and
+    `test_a_tool_that_raises_becomes_a_result_without_leaking_the_message`; this test asserts only
+    the layer it owns, which is where the raise now comes from.
     """
 
     class Undescribable(StagedChange):

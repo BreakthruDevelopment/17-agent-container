@@ -285,6 +285,11 @@ class ClampingPay(Tool[ClampArgs]):
 
     def __init__(self, description: str | None = None) -> None:
         self.paid: list[int] = []
+        # The arguments object the gate was handed, set by `staged_pay_behind_a_clamp`. The gate
+        # snapshots it deeply, so the clamp hook beneath rewrites the snapshot and leaves this
+        # one as it was staged -- which is what `pay_record_as_it_would_read` must render from
+        # before `apply()`, now that the suite calls `recomposed()` at stage time as well.
+        self.staged_args: ClampArgs | None = None
         # The same record at model granularity: the idiom `EchoTool.calls` uses. A probe reporting
         # this instead of the scalar defeated an earlier, one-sided version of
         # `StagedChangeContract`, so a case using it is checked in.
@@ -333,7 +338,9 @@ def staged_pay_behind_a_clamp(
         requires="pay.write",
     )
     ctx = ToolContext("run-1", 1, "call-1", identity=Identity("u1", frozenset({"pay.write"})))
-    result = asyncio.run(gate.run(ClampArgs(amount=amount), ctx))
+    staged_args = ClampArgs(amount=amount)
+    pay.staged_args = staged_args
+    result = asyncio.run(gate.run(staged_args, ctx))
     change = result.staged
     assert change is not None, "the gate did not stage the write"
     return change, pay
@@ -347,7 +354,15 @@ def pay_record_as_it_would_read(
     A thin view over real state, which is what `StagedCase.recomposed` must be: it reads the very
     model object the applied call received -- the same object the gate snapshotted, which is why
     the defect existed -- and renders it exactly as `ToolCallChange` would.
+
+    Before `apply()` there is no received object, so it renders from the arguments the gate was
+    handed. That branch used to be `ClampArgs()`: dead while the suite called `recomposed()` only
+    after `apply()`, and then accidentally right, because every case here stages 5000 and 5000 is
+    the field's default. The stage-time calibration makes the branch live, and a case staging any
+    other amount would have failed spuriously against a default-valued literal.
     """
-    args = pay.received[-1] if pay.received else ClampArgs()
+    staged = pay.staged_args
+    assert staged is not None, "this pay tool was not staged through staged_pay_behind_a_clamp"
+    args = pay.received[-1] if pay.received else staged
     full = f"{pay.name}: {pay.description} (arguments: {args.model_dump_json()})"
     return limit_description(redact(full) if redact else full)
