@@ -222,21 +222,48 @@ class _RedactedStaged(StagedChange):
     Three paths carry text from the change to a person, and all three go through the redactor:
     the description (redacted whole, *then* shortened, so a secret straddling the display limit
     cannot survive as a fragment), and the message of any failure when applying.
+
+    The two description paths are rendered once, at staging; only the failure message is redacted
+    when it is raised. See `__init__`.
     """
 
     def __init__(self, change: StagedChange, redact: Callable[[str], str]) -> None:
         self._change = change
+        # Kept for `apply()`. A failure message is produced when the change is applied, not when
+        # it is staged, so it is redacted then, with the patterns as they stand.
         self._redact = redact
+        # Rendered once, now, for the reason `ToolCallChange.__init__` renders its own text once:
+        # `description` is the record of what the approver was shown, and a record that moves is
+        # worse than none, because it reads as corroboration. Freezing the text beneath this
+        # wrapper was not enough, because both steps this wrapper adds were themselves live:
+        # redaction read `Redacting._replacement` on every read, so replacing it after staging
+        # moved the record (measured: `{"amount":[redacted]}` became `{"amount":[CHANGED]}`), and
+        # the shortening read the module-level `MAX_DESCRIPTION_CHARS` the same way. Neither is
+        # reachable from the applied call -- a tool or an interceptor beneath the gate sees only
+        # `ToolContext`, which carries no decorator configuration -- so this is the letter of
+        # `StagedChange.description`'s contract rather than a live defect. Frozen anyway: the
+        # contract is that the string does not move, and "nothing can reach it today" is not a
+        # property three dependent apps should have to re-derive.
+        #
+        # Rendering here, rather than on first read, moves any failure in the change beneath
+        # (a description that raises) into `Redacting.run`, where the loop turns it into an
+        # `internal` result and nothing is staged. That mirrors what freezing `ToolCallChange`
+        # did at the gate, and is tested in the same shape.
+        full = getattr(change, "full_description", None)
+        self._full_description = redact(full if isinstance(full, str) else change.description)
+        self._description = limit_description(self._full_description)
 
     @property
     def full_description(self) -> str:
-        """Redacted, not shortened. An outer wrapper redacts this again before shortening."""
-        full = getattr(self._change, "full_description", None)
-        return self._redact(full if isinstance(full, str) else self._change.description)
+        """Redacted, not shortened. An outer wrapper redacts this again before shortening.
+
+        Fixed when the change was staged; see `__init__`.
+        """
+        return self._full_description
 
     @property
     def description(self) -> str:
-        return limit_description(self.full_description)
+        return self._description
 
     async def apply(self) -> None:
         failure: str | None = None
