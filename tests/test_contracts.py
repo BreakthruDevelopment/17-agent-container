@@ -243,12 +243,13 @@ class _InvisiblyRewrittenCase(StagedChangeContract):
 
 
 class _MisrenderedCase(StagedChangeContract):
-    """A real, frozen change whose `recomposed` is not the renderer that produced the record.
+    """A real, **frozen** change whose `recomposed` is not the renderer that produced the record.
 
     `repr(ClampArgs(...))` differs from the record *because of* the rewrite, so it looks like the
-    difference check firing correctly -- and it would pass just as well on a record that never
-    displayed the field. It is the shape that defends against a renderer which is a genuine render
-    of real state but not of the record under test.
+    difference check firing correctly. This case witnesses that the calibration rejects a
+    mis-specified renderer; it does not witness a false pass, because the change under it is
+    genuinely frozen. `_MisrenderedThawedCase` below is the dangerous combination -- the same
+    renderer over a record that does move.
     """
 
     def make_change(self) -> StagedCase:
@@ -259,6 +260,41 @@ class _MisrenderedCase(StagedChangeContract):
             approved_value="5000",
             rewritten_value="100",
             recomposed=lambda: repr(pay.received[-1] if pay.received else pay.staged_args),
+        )
+
+
+class _MisrenderedThawed(StagedChange):
+    """B4 in full: a live record *and* a renderer that reports the same argument another way.
+
+    `repr(args)` differs from the record because of the rewrite, which is what the difference
+    check was looking for -- so round 4 passed this with a record that provably moves.
+    """
+
+    def __init__(self) -> None:
+        self.args = _InvisibleArgs()
+        self.received: list[_InvisibleArgs] = []
+
+    @property
+    def description(self) -> str:
+        return f'pay: {{"amount":{self.args.amount}}}'
+
+    async def apply(self) -> None:
+        self.args.amount = 100
+        self.received.append(self.args)
+
+    def thaw(self) -> None:
+        self.args.amount = 1
+
+
+class _MisrenderedThawedCase(StagedChangeContract):
+    def make_change(self) -> StagedCase:
+        change = _MisrenderedThawed()
+        return StagedCase(
+            change,
+            lambda: change.received,
+            approved_value="5000",
+            rewritten_value="100",
+            recomposed=lambda: repr(change.args),
         )
 
 
@@ -326,8 +362,24 @@ def test_the_contract_rejects_a_recomposed_that_differs_for_its_own_reason() -> 
 
 
 def test_the_contract_rejects_a_renderer_that_is_not_the_records_renderer() -> None:
+    """A mis-specified renderer, over a change that is genuinely frozen.
+
+    Nothing here is unfrozen, so this pins only that the calibration refuses a renderer which is
+    not the record's. The witness below is the same renderer over a record that moves.
+    """
     with pytest.raises(AssertionError, match="does not render the record"):
         _MisrenderedCase().test_applying_does_not_rewrite_the_approval_record()
+
+
+def test_the_contract_rejects_a_misrendered_record_that_also_moves() -> None:
+    """B4 in full: provably unfrozen, and `recomposed` differs *because of* the rewrite."""
+    change = _MisrenderedThawed()
+    before = change.description
+    change.thaw()
+    assert change.description != before, "this witness is supposed to be unfrozen"
+
+    with pytest.raises(AssertionError, match="does not render the record"):
+        _MisrenderedThawedCase().test_applying_does_not_rewrite_the_approval_record()
 
 
 class _InvisibleFieldArgs(BaseModel):

@@ -323,9 +323,15 @@ class StagedChangeContract(ABC):
     report. Those four relations are still only facts about two strings, and a third version of
     this suite overstated them -- nothing in them ties the two values to the **same** argument, so
     a case that rewrote a field the record never displays satisfied all four while a provably live
-    description went green. `recomposed` closes that: the suite renders the record from the
+    description went green. `recomposed` narrows that: the suite renders the record from the
     arguments as they stand after `apply()` and requires it to differ from the staged record, so
-    the rewrite must be one a live description would have shown.
+    the rewrite is usually one a live description would have shown. Not always, even with the
+    calibration below -- two renderers that genuinely agree at stage time can still diverge after
+    for a reason the record does not display. A renderer that includes a field only when it is
+    non-empty (what `exclude_none` and `exclude_defaults` do) agrees byte for byte while that
+    field is empty, and `apply()` filling it moves `recomposed` without moving a live record. That
+    case is far narrower than the five below and is a thin view over real state, so the advice at
+    the end of this docstring does not catch it; it is stated here rather than claimed closed.
 
     A fourth version checked that difference and nothing else, which let the difference arise for
     a reason unrelated to the rewrite. Five of six provably-unfrozen witnesses passed it: a
@@ -384,10 +390,14 @@ class StagedChangeContract(ABC):
         # does not share with the record -- and five provably-unfrozen witnesses passed on
         # exactly that. Agreement now, disagreement later, is what ties the difference to the
         # rewrite.
+        # Rendered into a local, not called twice here: `_require`'s message is an eager
+        # f-string, so calling it again in the message both doubled the render cost for every
+        # subclass and quoted a string the comparison never saw.
+        at_stage = case.recomposed()
         _require(
-            case.recomposed() == shown_at_approval,
+            at_stage == shown_at_approval,
             "this case's `recomposed` does not render the record: before apply() it reads "
-            f"{case.recomposed()!r} while the record reads {shown_at_approval!r}. A renderer "
+            f"{at_stage!r} while the record reads {shown_at_approval!r}. A renderer "
             "that disagrees with the record already cannot show that applying moved it.",
         )
 

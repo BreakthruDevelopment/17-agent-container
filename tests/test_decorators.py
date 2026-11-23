@@ -863,7 +863,12 @@ def test_the_approval_record_survives_a_hook_that_rewrites_the_arguments() -> No
 
 
 def test_redacting_does_not_thaw_the_approval_record() -> None:
-    """`_RedactedStaged` reads the change beneath it, so it is frozen only if that one is too."""
+    """The wrapper froze its own text in #20, so the change beneath it cannot thaw the record.
+
+    Before #20 this read the change beneath on every read and was frozen only if that one was.
+    It now renders at construction, so the record holds still whatever the inner change does --
+    which is what this asserts, with a real clamping hook rewriting the arguments underneath.
+    """
     change, pay = staged_pay_behind_a_clamp(amount=5000, clamp_to=100)
     redacted = _RedactedStaged(change, Redacting(EchoTool(), [r"secret-\d+"]).redact)
 
