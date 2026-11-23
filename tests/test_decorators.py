@@ -27,6 +27,7 @@ from agent_container.core import (
     Policy,
     Redacting,
     Retrying,
+    StagedChange,
     StagedChangeError,
     Tool,
     ToolContext,
@@ -34,7 +35,11 @@ from agent_container.core import (
     TurnOutputCap,
     has_write_gate,
 )
-from agent_container.core.decorators import _RedactedStaged
+from agent_container.core.decorators import (
+    MAX_DESCRIPTION_CHARS,
+    _RedactedStaged,
+    limit_description,
+)
 from agent_container.core.interceptors import TURN_CAP_NOTICE, TURN_CAP_OMITTED
 from agent_container.testing import ToolContract
 from tests.support import (
@@ -858,7 +863,12 @@ def test_the_approval_record_survives_a_hook_that_rewrites_the_arguments() -> No
 
 
 def test_redacting_does_not_thaw_the_approval_record() -> None:
-    """`_RedactedStaged` re-renders on every read, so it is frozen only if the change beneath is."""
+    """The wrapper froze its own text in #20, so the change beneath it cannot thaw the record.
+
+    Before #20 this read the change beneath on every read and was frozen only if that one was.
+    It now renders at construction, so the record holds still whatever the inner change does --
+    which is what this asserts, with a real clamping hook rewriting the arguments underneath.
+    """
     change, pay = staged_pay_behind_a_clamp(amount=5000, clamp_to=100)
     redacted = _RedactedStaged(change, Redacting(EchoTool(), [r"secret-\d+"]).redact)
 
@@ -869,6 +879,103 @@ def test_redacting_does_not_thaw_the_approval_record() -> None:
     assert redacted.description == shown_at_approval, (
         "the redacting wrapper rewrote the approval record after apply()"
     )
+
+
+async def test_mutating_the_redactor_after_staging_does_not_move_the_record() -> None:
+    """The wrapper's own two steps must be frozen too, not just the text beneath it.
+
+    Freezing `ToolCallChange` stopped the *applied call* from rewriting the record. It left the
+    redactor live: `_RedactedStaged` called `Redacting.redact` on every read, so replacing
+    `_replacement` after staging moved the record. Not reachable from the applied call, which
+    sees only `ToolContext` -- so this pins the letter of `StagedChange.description`'s contract,
+    which three dependent apps read as a guarantee.
+    """
+    redacting = Redacting(PermissionGate(CountingWrite()), [PATTERN])
+    staged = (await redacting.run(EchoArgs(text=SECRET), ctx())).staged
+    assert staged is not None, "the gate did not stage the write"
+    shown_at_approval = staged.description
+    assert "[redacted]" in shown_at_approval, "this case needs a record the redactor rewrote"
+
+    redacting._replacement = "[CHANGED]"
+
+    # The mutation really does move what the redactor produces -- a change staged now carries it
+    # -- so an unfrozen record would have moved and this test is not vacuous.
+    after = (await redacting.run(EchoArgs(text=SECRET), ctx())).staged
+    assert after is not None, "the gate did not stage the second write"
+    assert "[CHANGED]" in after.description, "the replacement never took effect"
+
+    assert staged.description == shown_at_approval, (
+        "replacing the redactor's replacement rewrote the record of what was approved: "
+        f"approved {shown_at_approval!r}, now reads {staged.description!r}"
+    )
+
+
+async def test_patching_the_display_limit_after_staging_does_not_shorten_the_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shortening step was live for the same reason: it read a module global per call."""
+    redacting = Redacting(PermissionGate(CountingWrite()), [PATTERN])
+    staged = (await redacting.run(EchoArgs(text="a" * 200), ctx())).staged
+    assert staged is not None, "the gate did not stage the write"
+    shown_at_approval = staged.description
+    assert len(shown_at_approval) > 40, "this case needs a record long enough to be cut short"
+
+    monkeypatch.setattr("agent_container.core.decorators.MAX_DESCRIPTION_CHARS", 20)
+    # The patch really bites: anything shortened from here on is cut, so an unfrozen record
+    # would have moved.
+    assert limit_description("b" * 100) == "b" * 20 + "..."
+
+    assert staged.description == shown_at_approval, (
+        "patching the display limit after staging shortened the record of what was approved: "
+        f"approved {shown_at_approval!r}, now reads {staged.description!r}"
+    )
+
+
+async def test_the_redacted_record_is_shortened_to_the_display_limit() -> None:
+    """Nothing pinned that the wrapper shortens the record *at all*, only that it does not move.
+
+    Measured: replacing `limit_description(self._full_description)` with the raw string left all
+    591 tests green. The straddling test above asserts a secret is absent, which a longer record
+    satisfies just as well.
+    """
+    long_text = "a" * (MAX_DESCRIPTION_CHARS * 2)
+    staged = (
+        await Redacting(PermissionGate(CountingWrite()), [PATTERN]).run(
+            EchoArgs(text=long_text), ctx()
+        )
+    ).staged
+    assert staged is not None, "the gate did not stage the write"
+    assert staged.description.endswith("...")
+    assert len(staged.description) == MAX_DESCRIPTION_CHARS + len("...")
+
+
+async def test_a_change_that_cannot_be_described_fails_where_it_is_staged() -> None:
+    """Rendering at staging moves this failure into `Redacting.run`, as the gate's did.
+
+    The same behaviour change `test_an_undescribable_write_fails_at_the_gate_not_at_the_approver`
+    pins one layer down, and worth pinning rather than discovering: the loop turns a raised
+    exception into an `internal`, non-retryable result, so the model is told the call failed and
+    nothing is staged -- which is right, because there is nothing a person could read to approve.
+    That handling is itself pinned, in `tests/test_loop.py`, by
+    `test_a_tool_that_raises_is_categorised_internal_not_business` and
+    `test_a_tool_that_raises_becomes_a_result_without_leaking_the_message`; this test asserts only
+    the layer it owns, which is where the raise now comes from.
+    """
+
+    class Undescribable(StagedChange):
+        @property
+        def description(self) -> str:
+            raise RuntimeError("this change cannot be described")
+
+        async def apply(self) -> None:
+            raise AssertionError("an undescribable change must never be applied")
+
+    class StagesSomethingOdd(DeleteTool):
+        async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+            return ToolResult.ok("staged", staged=Undescribable())
+
+    with pytest.raises(RuntimeError, match="cannot be described"):
+        await Redacting(StagesSomethingOdd(), [PATTERN]).run(EchoArgs(text="x"), ctx())
 
 
 def test_an_undescribable_write_fails_at_the_gate_not_at_the_approver() -> None:
