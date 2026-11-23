@@ -264,23 +264,28 @@ class _MisrenderedCase(StagedChangeContract):
 
 
 class _MisrenderedThawed(StagedChange):
-    """B4 in full: a live record *and* a renderer that reports the same argument another way.
+    """B4 in full: a live record, a rewrite it never displays, and `repr(args)` as the renderer.
 
-    `repr(args)` differs from the record because of the rewrite, which is what the difference
-    check was looking for -- so round 4 passed this with a record that provably moves.
+    The first version of this witness rewrote `amount`, which the record *does* display, so the
+    live record moved and the suite's final equality caught it with no calibration present. It
+    went red when the calibration was removed only because its `pytest.raises` pins the
+    calibration's message -- a test red for a reason other than the one it names, which is this
+    file's recurring defect and was caught in review. The rewrite is now of `memo`, invisible to
+    the record, so this is a genuine round-4 bypass: measured passing the pre-calibration suite
+    with a record that `thaw()` proves live.
     """
 
     def __init__(self) -> None:
         self.args = _InvisibleArgs()
-        self.received: list[_InvisibleArgs] = []
+        self.calls: list[str] = []
 
     @property
     def description(self) -> str:
         return f'pay: {{"amount":{self.args.amount}}}'
 
     async def apply(self) -> None:
-        self.args.amount = 100
-        self.received.append(self.args)
+        self.args.memo = "100"
+        self.calls.append(f"memo={self.args.memo}")
 
     def thaw(self) -> None:
         self.args.amount = 1
@@ -291,7 +296,7 @@ class _MisrenderedThawedCase(StagedChangeContract):
         change = _MisrenderedThawed()
         return StagedCase(
             change,
-            lambda: change.received,
+            lambda: change.calls,
             approved_value="5000",
             rewritten_value="100",
             recomposed=lambda: repr(change.args),
@@ -372,7 +377,12 @@ def test_the_contract_rejects_a_renderer_that_is_not_the_records_renderer() -> N
 
 
 def test_the_contract_rejects_a_misrendered_record_that_also_moves() -> None:
-    """B4 in full: provably unfrozen, and `recomposed` differs *because of* the rewrite."""
+    """B4 in full: provably unfrozen, the rewrite invisible to the record, `repr(args)` renderer.
+
+    Distinct from `_MisrenderedCase` above, which is the same renderer over a change that is
+    genuinely frozen and so witnesses only that the calibration refuses a mis-specified renderer.
+    This one passed the pre-calibration suite outright.
+    """
     change = _MisrenderedThawed()
     before = change.description
     change.thaw()
