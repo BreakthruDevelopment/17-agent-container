@@ -80,6 +80,26 @@ class ToolResult:
     staged: StagedChange | None = None
 
     def __post_init__(self) -> None:
+        # Normalise the category to a member, once, here -- so every `ToolResult` in the system
+        # carries one however it was built: directly, through `error()`, or through
+        # `dataclasses.replace` (which `Cached` and `Redacting` use). A plain wire value such as
+        # `"transient"` is *equal* to its member but is not it, so `is` and `match` over the enum
+        # take the wrong branch -- here, and in the three apps that import this library and can
+        # match on a category this one handed them. An unknown value is a `ValueError`, not a
+        # default, exactly as `Policy(policy)` in `gate.py` already is.
+        #
+        # `raw: object` so the `isinstance` narrowing is real to the type checker: the field is
+        # annotated `ErrorCategory | None`, and under `warn_unreachable` a check against the
+        # declared type reads as dead code. The runtime values are what this guards.
+        raw: object = self.error_category
+        if raw is not None and not isinstance(raw, ErrorCategory):
+            if not isinstance(raw, str):
+                # Neither a member nor a wire value: there is nothing honest to coerce it to, and
+                # storing it would put a non-category where every reader expects one. The message
+                # names the field, never the value.
+                raise ValueError("error_category must be an ErrorCategory")
+            # frozen=True, slots=True: this is the sanctioned way to normalise in __post_init__.
+            object.__setattr__(self, "error_category", ErrorCategory(raw))
         if self.is_error and self.error_category is None:
             raise ValueError("an error result needs an error_category")
         if not self.is_error and (self.error_category is not None or self.is_retryable):
@@ -98,6 +118,11 @@ class ToolResult:
         retryable: bool | None = None,
     ) -> ToolResult:
         """A failed result. `retryable` defaults to True only for transient errors."""
+        # Coerced here as well as in `__post_init__`, because the default below is computed from
+        # the *parameter*, before the dataclass exists. The signature says `ErrorCategory`, and
+        # that stays the contract; this only stops an untyped caller's `"transient"` from
+        # defaulting to not-retryable, which is the wrong answer for a retryable error.
+        category = ErrorCategory(category)
         if retryable is None:
             retryable = category is ErrorCategory.TRANSIENT
         return cls(message, is_error=True, error_category=category, is_retryable=retryable)
