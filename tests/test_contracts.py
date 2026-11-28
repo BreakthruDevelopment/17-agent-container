@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 
 import pytest
@@ -27,6 +28,19 @@ from tests.support import (
     pay_record_as_it_would_read,
     staged_pay_behind_a_clamp,
 )
+
+BITING_PATTERN = r"supplier"
+"""A redaction pattern that matches the `pay` record, unlike the suite's usual `secret-\\d+`.
+
+`secret-\\d+` appears nowhere in `pay: Pay a supplier. (arguments: {"amount":5000})`, so a case
+using it exercises `Redacting`'s redaction step not at all: the redacted and unredacted renders of
+the same record are byte-identical. Every case here that depends on the redaction step having an
+effect uses this instead.
+
+Sharing the constant stops the *constant* drifting, not a *case* drifting off it:
+`test_the_omitted_step_really_changes_the_record` is what pins that the pattern actually bit, and
+it has to read each dependent case's own `make_change()` to do so. Measured in PR #28's review.
+"""
 
 
 class TestReplayProviderContract(ModelProviderContract):
@@ -83,7 +97,10 @@ class TestRedactedStagedContract(StagedChangeContract):
 
     def make_change(self) -> StagedCase:
         change, pay = staged_pay_behind_a_clamp()
-        redacting = Redacting(EchoTool(), [r"secret-\d+"])
+        # `BITING_PATTERN`, not the suite's usual `secret-\d+`, which matches nothing in this
+        # record: with it, the wrapper's redaction step had no effect and the suite's only
+        # positive case for `_RedactedStaged` never exercised the step #21 froze. #26 item 4.
+        redacting = Redacting(EchoTool(), [BITING_PATTERN])
         return StagedCase(
             _RedactedStaged(change, redacting.redact),
             lambda: pay.paid,
@@ -462,15 +479,17 @@ class _OmitsTheRedactionStepCase(StagedChangeContract):
     renderer leaves out. The difference check alone cannot tell that from a frozen record: the
     omitted step is not where the rewrite shows up. Only the stage-time calibration sees it.
 
-    The pattern is `supplier`, a word the description actually contains, so the omission really
-    changes the string -- `test_the_omitted_step_really_changes_the_record` pins that. With the
-    suite's usual `secret-\\d+`, which matches nothing in this record, redaction is a no-op and
-    both renderers agree: the case would go green and witness nothing at all.
+    The pattern is `BITING_PATTERN`, a word the description actually contains, so the omission
+    really changes the string -- `test_the_omitted_step_really_changes_the_record` pins that, and
+    reads this case's own `make_change()` rather than rebuilding a parallel one, so changing the
+    pattern here cannot leave that guard green (#26 item 1). With the suite's usual `secret-\\d+`,
+    which matches nothing in this record, redaction is a no-op and both renderers agree: the case
+    would go green and witness nothing at all.
     """
 
     def make_change(self) -> StagedCase:
         change, pay = staged_pay_behind_a_clamp()
-        redacting = Redacting(EchoTool(), [r"supplier"])
+        redacting = Redacting(EchoTool(), [BITING_PATTERN])
         return StagedCase(
             _RedactedStaged(change, redacting.redact),
             lambda: pay.paid,
@@ -483,15 +502,39 @@ class _OmitsTheRedactionStepCase(StagedChangeContract):
 
 
 def test_the_omitted_step_really_changes_the_record() -> None:
-    """Without this, B3 below would pass on a redaction that was a no-op."""
-    change, pay = staged_pay_behind_a_clamp()
-    redacting = Redacting(EchoTool(), [r"supplier"])
-    redacted = _RedactedStaged(change, redacting.redact)
+    """Without this, B3 below would pass on a redaction that was a no-op.
 
-    assert "[redacted]" in redacted.description, "the pattern never matched the record"
-    assert redacted.description != pay_record_as_it_would_read(pay), (
+    Reads the case's own `make_change()`, so there is one construction rather than two. The first
+    version rebuilt its own `Redacting(EchoTool(), [r"supplier"])`, and measured: changing the
+    pattern inside `_OmitsTheRedactionStepCase` alone left this guard green and turned B3 red with
+    a bare `Failed: DID NOT RAISE AssertionError` -- the opaque message this guard exists to
+    replace. Drift was still caught, so that was a readability loss rather than a hole, but one
+    construction cannot drift from itself. #26 item 1.
+
+    It guards both cases that need `BITING_PATTERN` to bite, not only B3's. PR #28's review
+    measured the gap: replacing the constant with `secret-\\d+` inside
+    `TestRedactedStagedContract.make_change()` alone left the whole suite green at 603 passed,
+    because this guard read only `_OmitsTheRedactionStepCase`. A shared constant stops the
+    constant drifting; it does not stop a *case* drifting off it, and only reading each case's
+    own `make_change()` does. Non-blocking there because the drift weakens a positive case rather
+    than letting something pass that should fail -- fixed here anyway, since an overstated
+    guarantee in the suite that exists to catch overstated guarantees is the whole defect.
+    """
+    case = _OmitsTheRedactionStepCase().make_change()
+
+    assert "[redacted]" in case.change.description, "the pattern never matched the record"
+    assert case.change.description != case.recomposed(), (
         "the renderer that omits redaction agrees with the record anyway, so this case "
         "witnesses nothing"
+    )
+
+    # The suite's only positive case for `_RedactedStaged` (#26 item 4). Its own three tests pass
+    # either way -- `recomposed` redacts too, so they agree whether or not the step does anything
+    # -- which is exactly why the step has to be pinned from outside.
+    positive = TestRedactedStagedContract().make_change()
+    assert "[redacted]" in positive.change.description, (
+        "TestRedactedStagedContract's pattern never matched the record, so the suite's only "
+        "positive case for the wrapper exercises its redaction step not at all"
     )
 
 
@@ -506,3 +549,88 @@ def test_the_contract_rejects_a_renderer_that_omits_one_pipeline_step() -> None:
     """
     with pytest.raises(AssertionError, match="does not render the record"):
         _OmitsTheRedactionStepCase().test_applying_does_not_rewrite_the_approval_record()
+
+
+class _OmittedStepArgs(BaseModel):
+    amount: int = 5000
+    memo: str = "aaa"
+
+
+class _OmittedStepThawed(StagedChange):
+    """B3 in full: a **live** record, a rewrite it never displays, and a renderer missing a step.
+
+    `_OmitsTheRedactionStepCase` above is the omit-a-step renderer over a record that is genuinely
+    frozen, so it pins only that the calibration refuses such a renderer. This is the combination
+    that actually gets through: `StagedChangeContract`'s own docstring lists it among round 4's
+    bypasses -- "one differing by a pipeline step the record has and it does not (which is not
+    fabrication -- it can be a real, byte-for-byte render of real state, just not of the record
+    under test)" -- and nothing checked it in. #26 item 3.
+
+    Why each piece is needed, since the point is to be red for the calibration's reason and no
+    other (the defect `_MisrenderedThawed`'s docstring records):
+
+    - `description` recomposes on every read, so the record is **live**: `thaw()` moves it.
+    - `apply()` rewrites `memo`, which the record never displays, so the suite's final equality
+      sees an unmoved record and passes. A rewrite of `amount` would move the live record and the
+      equality would catch it with no calibration present.
+    - the record redacts and the case's renderer does not, so the two disagree at stage time
+      (which is what the calibration catches) *and* after (which satisfies the difference check,
+      for a reason unrelated to the rewrite -- exactly the loophole the calibration closed).
+
+    Measured with the calibration neutralised: green. The record is provably live.
+    """
+
+    def __init__(self) -> None:
+        self.args = _OmittedStepArgs()
+        self.calls: list[str] = []
+
+    def unredacted(self) -> str:
+        """The record's pipeline, minus the redaction step. Real state, honestly rendered."""
+        return f'pay: Pay a {BITING_PATTERN}. (arguments: {{"amount":{self.args.amount}}})'
+
+    @property
+    def description(self) -> str:
+        return self.unredacted().replace(BITING_PATTERN, "[redacted]")
+
+    async def apply(self) -> None:
+        self.args.memo = "100"
+        self.calls.append(f"memo={self.args.memo}")
+
+    def thaw(self) -> None:
+        self.args.amount = 1
+
+
+class _OmittedStepThawedCase(StagedChangeContract):
+    def make_change(self) -> StagedCase:
+        change = _OmittedStepThawed()
+        return StagedCase(
+            change,
+            lambda: change.calls,
+            approved_value="5000",
+            rewritten_value="100",
+            recomposed=change.unredacted,
+        )
+
+
+def test_the_contract_rejects_an_omitted_step_over_a_record_that_also_moves() -> None:
+    """B3's thawed twin: the combination that passed the pre-calibration suite.
+
+    The twin of `test_the_contract_rejects_a_misrendered_record_that_also_moves`, which is the
+    same escalation for the mis-specified-renderer shape.
+    """
+    change = _OmittedStepThawed()
+    before = change.description
+    change.thaw()
+    assert change.description != before, "this witness is supposed to be unfrozen"
+
+    # The rewrite really is invisible to the record, which is what makes the final equality
+    # check pass and leaves the calibration as the only thing standing. Without this the witness
+    # could be caught by the equality and the `pytest.raises` below would be red for the wrong
+    # reason -- the defect `_MisrenderedThawed`'s docstring records.
+    quiet = _OmittedStepThawed()
+    staged = quiet.description
+    asyncio.run(quiet.apply())
+    assert quiet.description == staged, "apply() moved the record, so the equality would catch it"
+
+    with pytest.raises(AssertionError, match="does not render the record"):
+        _OmittedStepThawedCase().test_applying_does_not_rewrite_the_approval_record()

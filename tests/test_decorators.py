@@ -1021,9 +1021,12 @@ async def test_patching_the_display_limit_after_staging_does_not_shorten_the_gat
     #19 froze the *text* `ToolCallChange` renders, and #21 froze both steps `_RedactedStaged`
     adds on top of it. What was left is the step the gate itself adds: `description` read the
     module-level `MAX_DESCRIPTION_CHARS` through `limit_description` on every call, so a record
-    staged behind a bare gate -- no `Redacting` wrapper -- moved when the cap moved. Measured on
-    `main` at 71ab218: a 334-character record read back as `'w: Write. (arguments...'`, while the
-    same change behind `Redacting` held still.
+    staged behind a bare gate -- no `Redacting` wrapper -- moved when the cap moved. Measured by
+    this test's own failure before the fix: a 250-character record read back as
+    `'delete: Delete somet...'`, while the same change behind `Redacting` held still. (An earlier
+    version of this docstring quoted `'w: Write. (arguments...'` from the ad-hoc script that found
+    the defect, against a differently-named tool -- a true measurement, but not of the test
+    beside it. #26 item 2.)
 
     Severity is the letter of the contract, not a live defect: `ToolContext` carries `run_id`,
     `turn`, `tool_use_id` and `identity` and nothing else, so neither a tool nor an interceptor
