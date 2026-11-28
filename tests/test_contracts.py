@@ -7,11 +7,22 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from typing import cast
 
 import pytest
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel, JsonValue, ValidationError
 
-from agent_container.core import AnyTool, ModelProvider, ModelResponse, StagedChange
+from agent_container.core import (
+    AnyTool,
+    Effect,
+    ErrorCategory,
+    ModelProvider,
+    ModelResponse,
+    StagedChange,
+    Tool,
+    ToolContext,
+    ToolResult,
+)
 from agent_container.core.decorators import Redacting, _RedactedStaged
 from agent_container.testing import (
     ModelProviderContract,
@@ -22,6 +33,7 @@ from agent_container.testing import (
 )
 from tests.support import (
     DeleteTool,
+    EchoArgs,
     EchoTool,
     PassThrough,
     ProbedReplay,
@@ -53,6 +65,56 @@ class TestReplayProviderContract(ModelProviderContract):
 class TestLeafToolContract(ToolContract):
     def make_tool(self) -> AnyTool:
         return EchoTool()
+
+    def valid_input(self) -> Mapping[str, JsonValue]:
+        return {"text": "hi"}
+
+    def invalid_input(self) -> Mapping[str, JsonValue]:
+        return {"text": 3}
+
+
+class _WireValueTool(Tool[EchoArgs]):
+    """A tool that answers invalid input *correctly* but names the category with the wire value.
+
+    `contracts.py` ships in the wheel for apps 18, 19 and 20 to subclass, and its validation
+    check asserted `result.error_category is ErrorCategory.VALIDATION`. A `StrEnum` member and
+    an equal plain string are different objects, so a tool like this one failed the shared
+    contract with `category was 'validation'` -- a message that reads as though the tool got it
+    wrong when the tool got it right. That is the second half of #11, and the one that would
+    have cost another app's builder an hour.
+
+    Nothing in `contracts.py` changed to fix it: `ToolResult` now normalises the category at
+    construction, so the identity check the suite already made is true for every result in the
+    system. This subclass is what proves it, from the outside, exactly as a consumer would.
+    """
+
+    name = "echo"
+    description = "Echo the text back."
+    effect = Effect.READ
+    input_model = EchoArgs
+
+    async def run(self, args: EchoArgs, ctx: ToolContext) -> ToolResult:
+        return ToolResult.ok(f"echo: {args.text}")
+
+    async def invoke(self, raw: Mapping[str, JsonValue], ctx: ToolContext) -> ToolResult:
+        try:
+            args = self.input_model.model_validate(dict(raw))
+        except ValidationError:
+            # The wire value, as a consumer's own helper or a category read out of JSON would
+            # hand it over. Never echoes the input: the field names only.
+            return ToolResult(
+                "the input did not validate",
+                is_error=True,
+                error_category=cast(ErrorCategory, "validation"),
+            )
+        return await self.run(args, ctx)
+
+
+class TestWireValueToolContract(ToolContract):
+    """The whole shared suite against a tool that speaks wire values (#11)."""
+
+    def make_tool(self) -> AnyTool:
+        return _WireValueTool()
 
     def valid_input(self) -> Mapping[str, JsonValue]:
         return {"text": "hi"}

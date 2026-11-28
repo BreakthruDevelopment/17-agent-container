@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from typing import cast
+
 import pytest
 from pydantic import BaseModel
 
@@ -15,6 +18,15 @@ from agent_container.core import (
 from tests.support import DeleteTool, EchoArgs, EchoTool, PassThrough
 
 CTX = ToolContext(run_id="r", turn=1, tool_use_id="c")
+
+
+def _wire(value: str) -> ErrorCategory:
+    """A plain `str` where the annotation says `ErrorCategory`, which is the whole point of #11.
+
+    The cast is the test's subject, not a convenience: it is exactly what an untyped caller --
+    JSON, a consumer app's helper, a `# type: ignore` -- hands this library at runtime.
+    """
+    return cast(ErrorCategory, value)
 
 
 def test_a_tool_must_declare_its_effect() -> None:
@@ -137,3 +149,65 @@ def test_inconsistent_results_are_rejected() -> None:
         ToolResult("x", is_retryable=True)
     with pytest.raises(ValueError, match="only an error"):
         ToolResult("x", error_category=ErrorCategory.BUSINESS)
+
+
+# -- the wire value is coerced to a member (#11) --------------------------------------------------
+#
+# `ErrorCategory` is a `StrEnum`, so `"transient" == ErrorCategory.TRANSIENT` while
+# `"transient" is ErrorCategory.TRANSIENT` is False. The annotations say `ErrorCategory`, but
+# nothing enforces that at runtime, and a caller holding the wire value -- a tool reading a
+# category out of JSON, a consumer app's own helper -- used to get a result whose
+# `error_category` stayed a plain `str`. That made the retry flag wrong here and every
+# downstream `is` and `match` wrong in the apps that import this library. The category is
+# normalised at construction instead, so no site has to remember.
+
+
+def test_the_wire_value_still_defaults_to_retryable() -> None:
+    """`is_retryable` was False for `"transient"`: the old default compared with `is`.
+
+    This is the defect #11 was filed for. It fails closed -- a transient error is reported
+    instead of retried -- but app 20's throttling eval depends on the retry actually happening.
+    """
+    r = ToolResult.error(_wire("transient"), "throttled, try again")
+    assert r.is_retryable is True
+    assert r.error_category is ErrorCategory.TRANSIENT
+
+
+def test_the_wire_value_is_a_member_however_the_result_was_built() -> None:
+    """Not just through `error()`: direct construction and `replace` go through the same gate.
+
+    `Cached` and `Redacting` rebuild results with `dataclasses.replace`, so a result that
+    entered a decorator stack carrying a plain string used to leave it carrying one.
+    """
+    direct = ToolResult("nope", is_error=True, error_category=_wire("validation"))
+    assert direct.error_category is ErrorCategory.VALIDATION
+
+    copied = replace(direct, content="still nope")
+    assert copied.error_category is ErrorCategory.VALIDATION
+
+
+def test_an_unknown_category_is_a_value_error_not_a_default() -> None:
+    """The library's standing rule, the same one `Policy(policy)` and `StopReason` follow.
+
+    A raise inside a tool is turned by the loop into a non-retryable `internal` result with a
+    fixed message, so this cannot reach the model or a client as text.
+    """
+    with pytest.raises(ValueError):
+        ToolResult.error(_wire("nonsense"), "x")
+    with pytest.raises(ValueError):
+        ToolResult("x", is_error=True, error_category=_wire("nonsense"))
+
+
+def test_a_category_that_is_not_even_a_string_is_refused() -> None:
+    """Nothing honest to coerce, so it is refused rather than stored for a later reader.
+
+    The message names the field and not the value: this one is reachable from a tool.
+    """
+    with pytest.raises(ValueError, match="error_category"):
+        ToolResult("x", is_error=True, error_category=cast(ErrorCategory, 3))
+
+
+def test_coercion_does_not_loosen_the_consistency_rules() -> None:
+    """A wire value must not become a way past `__post_init__`'s other checks."""
+    with pytest.raises(ValueError, match="only an error"):
+        ToolResult("x", error_category=_wire("business"))
