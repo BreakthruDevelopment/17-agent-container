@@ -446,3 +446,63 @@ def test_the_contract_rejects_a_rewrite_the_record_never_displays() -> None:
 
     with pytest.raises(AssertionError, match="never displays"):
         _InvisibleFieldCase().test_applying_does_not_rewrite_the_approval_record()
+
+
+class _OmitsTheRedactionStepCase(StagedChangeContract):
+    """B3: a renderer that omits only the wrapper's redaction step.
+
+    Verified as caught during PR #22's review but never checked in, which is the shape of defect
+    this repo keeps finding -- a check that exists only in a review is a check nobody runs. Item 3
+    of #24.
+
+    What makes it the subtle one: `pay_record_as_it_would_read(pay)` is not a fabrication and not
+    a literal. It is the record's own pipeline, reading the very model object the applied call
+    received, rendering a real byte-for-byte view of real state. It is simply not a view of *this*
+    record, because the record under test is seen through `Redacting`, which adds a step the
+    renderer leaves out. The difference check alone cannot tell that from a frozen record: the
+    omitted step is not where the rewrite shows up. Only the stage-time calibration sees it.
+
+    The pattern is `supplier`, a word the description actually contains, so the omission really
+    changes the string -- `test_the_omitted_step_really_changes_the_record` pins that. With the
+    suite's usual `secret-\\d+`, which matches nothing in this record, redaction is a no-op and
+    both renderers agree: the case would go green and witness nothing at all.
+    """
+
+    def make_change(self) -> StagedCase:
+        change, pay = staged_pay_behind_a_clamp()
+        redacting = Redacting(EchoTool(), [r"supplier"])
+        return StagedCase(
+            _RedactedStaged(change, redacting.redact),
+            lambda: pay.paid,
+            approved_value="5000",
+            rewritten_value="100",
+            # The record's pipeline, over real state -- but without the redaction step the
+            # wrapper above adds. Honest, and not this record.
+            recomposed=lambda: pay_record_as_it_would_read(pay),
+        )
+
+
+def test_the_omitted_step_really_changes_the_record() -> None:
+    """Without this, B3 below would pass on a redaction that was a no-op."""
+    change, pay = staged_pay_behind_a_clamp()
+    redacting = Redacting(EchoTool(), [r"supplier"])
+    redacted = _RedactedStaged(change, redacting.redact)
+
+    assert "[redacted]" in redacted.description, "the pattern never matched the record"
+    assert redacted.description != pay_record_as_it_would_read(pay), (
+        "the renderer that omits redaction agrees with the record anyway, so this case "
+        "witnesses nothing"
+    )
+
+
+def test_the_contract_rejects_a_renderer_that_omits_one_pipeline_step() -> None:
+    """B3. The record itself is frozen, so this pins the calibration, not a false pass.
+
+    The same standing as `_MisrenderedCase`: `_RedactedStaged` holds still (#20, #21), so there
+    is no unfrozen record here to catch. What is pinned is that a renderer which is a genuine
+    render of real state, differing from the record by one pipeline step rather than by
+    fabrication, is still refused -- which is the claim the docstring of `StagedChangeContract`
+    makes about why it calibrates before applying.
+    """
+    with pytest.raises(AssertionError, match="does not render the record"):
+        _OmitsTheRedactionStepCase().test_applying_does_not_rewrite_the_approval_record()
