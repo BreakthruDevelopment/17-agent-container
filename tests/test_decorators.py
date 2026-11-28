@@ -1011,3 +1011,52 @@ def test_an_undescribable_write_fails_at_the_gate_not_at_the_approver() -> None:
 
     with pytest.raises(PydanticSerializationError):
         asyncio.run(gate.run(WeirdArgs(payload=Unserializable()), context))
+
+
+async def test_patching_the_display_limit_after_staging_does_not_shorten_the_gate_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bare gate's own shortening step was still live, for the reason #21 fixed one layer up.
+
+    #19 froze the *text* `ToolCallChange` renders, and #21 froze both steps `_RedactedStaged`
+    adds on top of it. What was left is the step the gate itself adds: `description` read the
+    module-level `MAX_DESCRIPTION_CHARS` through `limit_description` on every call, so a record
+    staged behind a bare gate -- no `Redacting` wrapper -- moved when the cap moved. Measured on
+    `main` at 71ab218: a 334-character record read back as `'w: Write. (arguments...'`, while the
+    same change behind `Redacting` held still.
+
+    Severity is the letter of the contract, not a live defect: `ToolContext` carries `run_id`,
+    `turn`, `tool_use_id` and `identity` and nothing else, so neither a tool nor an interceptor
+    beneath the gate can reach a module global. Frozen anyway, for the reason #21 gives: the
+    contract is that the string does not move, and "nothing can reach it today" is not a property
+    apps 18, 19 and 20 should each have to re-derive.
+    """
+    staged = (await PermissionGate(DeleteTool()).run(EchoArgs(text="a" * 200), ctx())).staged
+    assert staged is not None, "the gate did not stage the write"
+    shown_at_approval = staged.description
+    assert len(shown_at_approval) > 40, "this case needs a record long enough to be cut short"
+
+    monkeypatch.setattr("agent_container.core.decorators.MAX_DESCRIPTION_CHARS", 20)
+    # The patch really bites: anything shortened from here on is cut, so an unfrozen record
+    # would have moved. Without this the test would pass on a cap that never took effect.
+    assert limit_description("b" * 100) == "b" * 20 + "..."
+
+    assert staged.description == shown_at_approval, (
+        "patching the display limit after staging shortened the record of what was approved: "
+        f"approved {shown_at_approval!r}, now reads {staged.description!r}"
+    )
+
+
+async def test_the_gate_record_is_shortened_to_the_display_limit() -> None:
+    """Freezing must not quietly stop the gate shortening the record *at all*.
+
+    The twin of `test_the_redacted_record_is_shortened_to_the_display_limit`, and for the reason
+    that one records: the test above asserts only that the string does not move, which a record
+    that is never shortened satisfies just as well. Measured: with `self._description` set to the
+    raw `full_description`, the freeze test above stays green and only this one goes red.
+    """
+    long_text = "a" * (MAX_DESCRIPTION_CHARS * 2)
+    staged = (await PermissionGate(DeleteTool()).run(EchoArgs(text=long_text), ctx())).staged
+    assert staged is not None, "the gate did not stage the write"
+    assert staged.description.endswith("...")
+    assert len(staged.description) == MAX_DESCRIPTION_CHARS + len("...")

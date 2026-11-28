@@ -55,6 +55,18 @@ class ToolCallChange[A: BaseModel](StagedChange):
             f"{self._tool.name}: {self._tool.description} "
             f"(arguments: {self._args.model_dump_json()})"
         )
+        # Shortened once, now, for the same reason and in the same shape as `_RedactedStaged`:
+        # `limit_description` reads the module-level `MAX_DESCRIPTION_CHARS` at call time, so
+        # shortening on every read left this last step of the record live even though the text
+        # beneath it was frozen. Measured: a 334-character staged record read back as
+        # `'w: Write. (arguments...'` under a patched cap, while the same change behind
+        # `Redacting` held still. Not reachable from the applied call -- `ToolContext` carries
+        # `run_id`, `turn`, `tool_use_id` and `identity`, so neither a tool nor an interceptor
+        # beneath the gate can reach a module global -- so this is the letter of
+        # `StagedChange.description`'s contract rather than a live defect. Frozen anyway: the
+        # contract is that the string does not move, and apps 18, 19 and 20 should not each have
+        # to re-derive that nothing can reach it today.
+        self._description = limit_description(self._full_description)
 
     @property
     def full_description(self) -> str:
@@ -66,7 +78,8 @@ class ToolCallChange[A: BaseModel](StagedChange):
 
     @property
     def description(self) -> str:
-        return limit_description(self.full_description)
+        """The record of what the approver was shown. Fixed when the change was staged."""
+        return self._description
 
     async def apply(self) -> None:
         if self._attempted:
