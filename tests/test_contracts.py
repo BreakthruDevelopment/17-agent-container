@@ -35,7 +35,11 @@ BITING_PATTERN = r"supplier"
 `secret-\\d+` appears nowhere in `pay: Pay a supplier. (arguments: {"amount":5000})`, so a case
 using it exercises `Redacting`'s redaction step not at all: the redacted and unredacted renders of
 the same record are byte-identical. Every case here that depends on the redaction step having an
-effect uses this instead, and pins that it bit.
+effect uses this instead.
+
+Sharing the constant stops the *constant* drifting, not a *case* drifting off it:
+`test_the_omitted_step_really_changes_the_record` is what pins that the pattern actually bit, and
+it has to read each dependent case's own `make_change()` to do so. Measured in PR #28's review.
 """
 
 
@@ -506,6 +510,15 @@ def test_the_omitted_step_really_changes_the_record() -> None:
     a bare `Failed: DID NOT RAISE AssertionError` -- the opaque message this guard exists to
     replace. Drift was still caught, so that was a readability loss rather than a hole, but one
     construction cannot drift from itself. #26 item 1.
+
+    It guards both cases that need `BITING_PATTERN` to bite, not only B3's. PR #28's review
+    measured the gap: replacing the constant with `secret-\\d+` inside
+    `TestRedactedStagedContract.make_change()` alone left the whole suite green at 603 passed,
+    because this guard read only `_OmitsTheRedactionStepCase`. A shared constant stops the
+    constant drifting; it does not stop a *case* drifting off it, and only reading each case's
+    own `make_change()` does. Non-blocking there because the drift weakens a positive case rather
+    than letting something pass that should fail -- fixed here anyway, since an overstated
+    guarantee in the suite that exists to catch overstated guarantees is the whole defect.
     """
     case = _OmitsTheRedactionStepCase().make_change()
 
@@ -513,6 +526,15 @@ def test_the_omitted_step_really_changes_the_record() -> None:
     assert case.change.description != case.recomposed(), (
         "the renderer that omits redaction agrees with the record anyway, so this case "
         "witnesses nothing"
+    )
+
+    # The suite's only positive case for `_RedactedStaged` (#26 item 4). Its own three tests pass
+    # either way -- `recomposed` redacts too, so they agree whether or not the step does anything
+    # -- which is exactly why the step has to be pinned from outside.
+    positive = TestRedactedStagedContract().make_change()
+    assert "[redacted]" in positive.change.description, (
+        "TestRedactedStagedContract's pattern never matched the record, so the suite's only "
+        "positive case for the wrapper exercises its redaction step not at all"
     )
 
 
